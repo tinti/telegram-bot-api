@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
@@ -8,19 +9,18 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"encoding/json"
 
 	"github.com/streadway/amqp"
 )
 
 type RequestMessage struct {
-	Op string
+	Op    string
 	Value int
 }
 
 type ResponseMessage struct {
-	Op string
-	Value int
+	Op            string
+	Value         int
 	ResponseValue int
 }
 
