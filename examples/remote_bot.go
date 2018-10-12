@@ -15,6 +15,13 @@ func main() {
 	params := url.Values{}
 
 	apiResponse, err := r.MakeRequest(endpoint, params)
+	fmt.Println(apiResponse, err)
 
+	endpoint = "hey"
+	params2 := map[string]string{}
+	fieldname := ""
+	file := interface{}(nil)
+
+	apiResponse, err = r.UploadFile(endpoint, params2, fieldname, file)
 	fmt.Println(apiResponse, err)
 }
