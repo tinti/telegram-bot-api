@@ -2,26 +2,24 @@ package main
 
 import (
 	"fmt"
-	"net/url"
 
 	"github.com/tinti/telegram-bot-api"
 )
 
 func main() {
-	go tgbotapi.DummyServer()
-	r := tgbotapi.RemoteBotAPI{}
+	bot, err := tgbotapi.NewBotAPI("mytoken")
+	if err != nil {
+		panic(err)
+	}
 
-	endpoint := "hi"
-	params := url.Values{}
+	url := "amqp://guest:guest@localhost:5672/guest"
+	go tgbotapi.SimpleServer(url, bot)
+	r, err := tgbotapi.RemoteBotDial(url)
+	if err != nil {
+		panic(err)
+	}
+	defer tgbotapi.RemoteBotClose(r)
 
-	apiResponse, err := r.MakeRequest(endpoint, params)
-	fmt.Println(apiResponse, err)
-
-	endpoint = "hey"
-	params2 := map[string]string{}
-	fieldname := ""
-	file := interface{}(nil)
-
-	apiResponse, err = r.UploadFile(endpoint, params2, fieldname, file)
-	fmt.Println(apiResponse, err)
+	me, err := r.GetMe()
+	fmt.Println(me, err)
 }
