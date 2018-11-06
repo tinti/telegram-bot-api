@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net/url"
+	"reflect"
 
 	"github.com/streadway/amqp"
 )
@@ -108,11 +109,48 @@ const (
 	OperationDeleteChatPhoto        = "DeleteChatPhoto"
 )
 
+type RequestMessageNoInt struct {
+	Operation     string
+	CorrelationId string
+
+	CType     string
+	Config    UserProfilePhotosConfig
+	Config2   FileConfig
+	Config3   UpdateConfig
+	Config4   WebhookConfig
+	Config5   InlineConfig
+	Config6   CallbackConfig
+	Config7   KickChatMemberConfig
+	Config8   ChatConfig
+	Config9   ChatConfigWithUser
+	Config10  ChatMemberConfig
+	Config11  RestrictChatMemberConfig
+	Config12  PromoteChatMemberConfig
+	Config13  GetGameHighScoresConfig
+	Config14  ShippingConfig
+	Config15  PreCheckoutConfig
+	Config16  DeleteMessageConfig
+	Config17  PinChatMessageConfig
+	Config18  UnpinChatMessageConfig
+	Config19  SetChatTitleConfig
+	Config20  SetChatDescriptionConfig
+	Config21  SetChatPhotoConfig
+	Config22  DeleteChatPhotoConfig
+	Endpoint  string
+	Fieldname string
+	FileID    string
+	Message   Message
+	Params    url.Values
+	Params2   map[string]string
+	Pattern   string
+}
+
 type RequestMessage struct {
 	Operation     string
 	CorrelationId string
 
 	C         Chattable
+	CType     string
 	Config    UserProfilePhotosConfig
 	Config2   FileConfig
 	Config3   UpdateConfig
@@ -145,26 +183,204 @@ type RequestMessage struct {
 	Pattern   string
 }
 
-type ResponseMessage struct {
+func RequestMessageUnmarshal(data []byte) (*RequestMessage, error) {
+	n := RequestMessage{}
+	if err := json.Unmarshal(data, &n); err != nil {
+		if _, ok := err.(*json.UnmarshalTypeError); ok {
+			// Type map
+			typeMap := map[string]reflect.Type{
+				"tgbotapi.MessageConfig": reflect.TypeOf(MessageConfig{}),
+			}
+
+			// Unmarshal raw
+			m := map[string]interface{}{}
+			if err := json.Unmarshal(data, &m); err != nil {
+				return nil, err
+			}
+
+			// Discover type of C based on CType
+			if cType, ok := m["CType"].(string); ok {
+				if reflectType, found := typeMap[cType]; found {
+					// Annotate type of C
+					n.C = reflect.New(reflectType).Interface().(Chattable)
+					n.CType = cType
+				}
+
+				// Marshal only C data
+				valueBytes, err := json.Marshal(m["C"])
+				if err != nil {
+					return nil, err
+				}
+
+				// Unmarshal only C data
+				if err = json.Unmarshal(valueBytes, &n.C); err != nil {
+					return nil, err
+				}
+			}
+
+			// Hard coded
+			var nI RequestMessageNoInt
+			if err = json.Unmarshal(data, &nI); err != nil {
+				return nil, err
+			}
+
+			n.Operation = nI.Operation
+			n.CorrelationId = nI.CorrelationId
+			n.CType = nI.CType
+			n.Config = nI.Config
+			n.Config2 = nI.Config2
+			n.Config3 = nI.Config3
+			n.Config4 = nI.Config4
+			n.Config5 = nI.Config5
+			n.Config6 = nI.Config6
+			n.Config7 = nI.Config7
+			n.Config8 = nI.Config8
+			n.Config9 = nI.Config9
+			n.Config10 = nI.Config10
+			n.Config11 = nI.Config11
+			n.Config12 = nI.Config12
+			n.Config13 = nI.Config13
+			n.Config14 = nI.Config14
+			n.Config15 = nI.Config15
+			n.Config16 = nI.Config16
+			n.Config17 = nI.Config17
+			n.Config18 = nI.Config18
+			n.Config19 = nI.Config19
+			n.Config20 = nI.Config20
+			n.Config21 = nI.Config21
+			n.Config22 = nI.Config22
+			n.Endpoint = nI.Endpoint
+			n.Fieldname = nI.Fieldname
+			n.FileID = nI.FileID
+			n.Message = nI.Message
+			n.Params = nI.Params
+			n.Params2 = nI.Params2
+			n.Pattern = nI.Pattern
+
+			return &n, nil
+		}
+
+		return nil, err
+	}
+
+	return &n, nil
+}
+
+type ResponseMessageNoInt struct {
 	Operation     string
 	CorrelationId string
 
-	R   APIResponse
-	R2  error
-	R3  string
-	R4  User
-	R5  bool
-	R6  Message
-	R7  UserProfilePhotos
-	R8  File
-	R9  []Update
-	R10 WebhookInfo
+	R      APIResponse
+	R2Type string
+	R3     string
+	R4     User
+	R5     bool
+	R6     Message
+	R7     UserProfilePhotos
+	R8     File
+	R9     []Update
+	R10    WebhookInfo
 	//R11 UpdatesChannel
 	R12 Chat
 	R13 []ChatMember
 	R14 int
 	R15 ChatMember
 	R16 []GameHighScore
+}
+
+type ResponseMessage struct {
+	Operation     string
+	CorrelationId string
+
+	R      APIResponse
+	R2     error
+	R2Type string
+	R3     string
+	R4     User
+	R5     bool
+	R6     Message
+	R7     UserProfilePhotos
+	R8     File
+	R9     []Update
+	R10    WebhookInfo
+	//R11 UpdatesChannel
+	R12 Chat
+	R13 []ChatMember
+	R14 int
+	R15 ChatMember
+	R16 []GameHighScore
+}
+
+type ResponseMessageErrorString struct {
+	s string
+}
+
+func ResponseMessageUnmarshal(data []byte) (*ResponseMessage, error) {
+	n := ResponseMessage{}
+	if err := json.Unmarshal(data, &n); err != nil {
+		if _, ok := err.(*json.UnmarshalTypeError); ok {
+			// Type map
+			typeMap := map[string]reflect.Type{
+				"errors.errorString": reflect.TypeOf(ResponseMessageErrorString{}),
+			}
+
+			// Unmarshal raw
+			m := map[string]interface{}{}
+			if err := json.Unmarshal(data, &m); err != nil {
+				return nil, err
+			}
+
+			// Discover type of R2 based on R2Type
+			if r2Type, ok := m["R2Type"].(string); ok {
+				if reflectType, found := typeMap[r2Type]; found {
+					// Annotate type of R2
+					n.R2 = reflect.New(reflectType).Interface().(error)
+					n.R2Type = r2Type
+				}
+
+				// Marshal only R2 data
+				valueBytes, err := json.Marshal(m["R2"])
+				if err != nil {
+					return nil, err
+				}
+
+				// Unmarshal only R2 data
+				if err = json.Unmarshal(valueBytes, &n.R2); err != nil {
+					return nil, err
+				}
+			}
+
+			// Hard coded
+			var nI ResponseMessageNoInt
+			if err = json.Unmarshal(data, &nI); err != nil {
+				return nil, err
+			}
+
+			n.Operation = nI.Operation
+			n.CorrelationId = nI.CorrelationId
+			n.R = nI.R
+			n.R2Type = nI.R2Type
+			n.R3 = nI.R3
+			n.R4 = nI.R4
+			n.R5 = nI.R5
+			n.R6 = nI.R6
+			n.R7 = nI.R7
+			n.R8 = nI.R8
+			n.R9 = nI.R9
+			n.R10 = nI.R10
+			n.R12 = nI.R12
+			n.R13 = nI.R13
+			n.R14 = nI.R14
+			n.R15 = nI.R15
+			n.R16 = nI.R16
+
+			return &n, nil
+		}
+
+		return nil, err
+	}
+
+	return &n, nil
 }
 
 func RemoteBotDial(url string) (*RemoteBotAPI, error) {
@@ -237,8 +453,9 @@ func (rbot *RemoteBotAPI) MakeRequest(endpoint string, params url.Values) (APIRe
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -298,8 +515,9 @@ func (rbot *RemoteBotAPI) UploadFile(endpoint string, params2 map[string]string,
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -356,8 +574,9 @@ func (rbot *RemoteBotAPI) GetFileDirectURL(fileID string) (string, error) {
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -413,8 +632,9 @@ func (rbot *RemoteBotAPI) GetMe() (User, error) {
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -471,8 +691,9 @@ func (rbot *RemoteBotAPI) IsMessageToMe(message Message) bool {
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -481,6 +702,8 @@ func (rbot *RemoteBotAPI) IsMessageToMe(message Message) bool {
 }
 
 func (rbot *RemoteBotAPI) Send(c Chattable) (Message, error) {
+	cType := reflect.TypeOf(c).String()
+
 	ch, err := rbot.Connection.Channel()
 	failOnError(err, "Failed to open a channel")
 	defer ch.Close()
@@ -510,6 +733,7 @@ func (rbot *RemoteBotAPI) Send(c Chattable) (Message, error) {
 		Operation:     OperationSend,
 		CorrelationId: randomString(32),
 		C:             c,
+		CType:         cType,
 	}
 	request, _ := json.Marshal(requestMessage)
 
@@ -529,8 +753,9 @@ func (rbot *RemoteBotAPI) Send(c Chattable) (Message, error) {
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -587,8 +812,9 @@ func (rbot *RemoteBotAPI) GetUserProfilePhotos(config UserProfilePhotosConfig) (
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -645,8 +871,9 @@ func (rbot *RemoteBotAPI) GetFile(config2 FileConfig) (File, error) {
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -703,8 +930,9 @@ func (rbot *RemoteBotAPI) GetUpdates(config3 UpdateConfig) ([]Update, error) {
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -760,8 +988,9 @@ func (rbot *RemoteBotAPI) RemoveWebhook() (APIResponse, error) {
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -818,8 +1047,9 @@ func (rbot *RemoteBotAPI) SetWebhook(config4 WebhookConfig) (APIResponse, error)
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -875,8 +1105,9 @@ func (rbot *RemoteBotAPI) GetWebhookInfo() (WebhookInfo, error) {
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -933,8 +1164,9 @@ func (rbot *RemoteBotAPI) GetUpdatesChan(config3 UpdateConfig) (UpdatesChannel, 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -989,11 +1221,12 @@ func (rbot *RemoteBotAPI) ListenForWebhook(pattern string) UpdatesChannel {
 		})
 	failOnError(err, "Failed to publish a message")
 
-	var response ResponseMessage
+	//var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
-			failOnError(err, "Failed to convert body to response")
+			//rP, err := ResponseMessageUnmarshal(d.Body)
+			//failOnError(err, "Failed to convert body to response")
+			//response = *rP
 			break
 		}
 	}
@@ -1051,8 +1284,9 @@ func (rbot *RemoteBotAPI) AnswerInlineQuery(config5 InlineConfig) (APIResponse, 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -1109,8 +1343,9 @@ func (rbot *RemoteBotAPI) AnswerCallbackQuery(config6 CallbackConfig) (APIRespon
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -1167,8 +1402,9 @@ func (rbot *RemoteBotAPI) KickChatMember(config7 KickChatMemberConfig) (APIRespo
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -1225,8 +1461,9 @@ func (rbot *RemoteBotAPI) LeaveChat(config8 ChatConfig) (APIResponse, error) {
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -1283,8 +1520,9 @@ func (rbot *RemoteBotAPI) GetChat(config8 ChatConfig) (Chat, error) {
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -1341,8 +1579,9 @@ func (rbot *RemoteBotAPI) GetChatAdministrators(config8 ChatConfig) ([]ChatMembe
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -1399,8 +1638,9 @@ func (rbot *RemoteBotAPI) GetChatMembersCount(config8 ChatConfig) (int, error) {
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -1457,8 +1697,9 @@ func (rbot *RemoteBotAPI) GetChatMember(config9 ChatConfigWithUser) (ChatMember,
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -1515,8 +1756,9 @@ func (rbot *RemoteBotAPI) UnbanChatMember(config10 ChatMemberConfig) (APIRespons
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -1573,8 +1815,9 @@ func (rbot *RemoteBotAPI) RestrictChatMember(config11 RestrictChatMemberConfig) 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -1631,8 +1874,9 @@ func (rbot *RemoteBotAPI) PromoteChatMember(config12 PromoteChatMemberConfig) (A
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -1689,8 +1933,9 @@ func (rbot *RemoteBotAPI) GetGameHighScores(config13 GetGameHighScoresConfig) ([
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -1747,8 +1992,9 @@ func (rbot *RemoteBotAPI) AnswerShippingQuery(config14 ShippingConfig) (APIRespo
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -1805,8 +2051,9 @@ func (rbot *RemoteBotAPI) AnswerPreCheckoutQuery(config15 PreCheckoutConfig) (AP
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -1863,8 +2110,9 @@ func (rbot *RemoteBotAPI) DeleteMessage(config16 DeleteMessageConfig) (APIRespon
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -1921,8 +2169,9 @@ func (rbot *RemoteBotAPI) GetInviteLink(config8 ChatConfig) (string, error) {
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -1979,8 +2228,9 @@ func (rbot *RemoteBotAPI) PinChatMessage(config17 PinChatMessageConfig) (APIResp
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -2037,8 +2287,9 @@ func (rbot *RemoteBotAPI) UnpinChatMessage(config18 UnpinChatMessageConfig) (API
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -2095,8 +2346,9 @@ func (rbot *RemoteBotAPI) SetChatTitle(config19 SetChatTitleConfig) (APIResponse
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -2153,8 +2405,9 @@ func (rbot *RemoteBotAPI) SetChatDescription(config20 SetChatDescriptionConfig) 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -2211,8 +2464,9 @@ func (rbot *RemoteBotAPI) SetChatPhoto(config21 SetChatPhotoConfig) (APIResponse
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -2269,8 +2523,9 @@ func (rbot *RemoteBotAPI) DeleteChatPhoto(config22 DeleteChatPhotoConfig) (APIRe
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
-			err = json.Unmarshal(d.Body, &response)
+			rP, err := ResponseMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to response")
+			response = *rP
 			break
 		}
 	}
@@ -2319,9 +2574,9 @@ func SimpleServer(url string, bot *BotAPI) {
 
 	go func() {
 		for d := range msgs {
-			n := RequestMessage{}
-			err := json.Unmarshal(d.Body, &n)
+			nP, err := RequestMessageUnmarshal(d.Body)
 			failOnError(err, "Failed to convert body to request")
+			n := *nP
 
 			var r ResponseMessage
 			switch n.Operation {
@@ -2365,11 +2620,18 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			case OperationSend:
-				message, err := bot.Send(n.C)
+				switch n.CType {
+				case reflect.TypeOf(MessageConfig{}).String():
+					m := n.C.(*MessageConfig)
+					message, err := bot.Send(m)
 
-				r = ResponseMessage{}
-				r.R6 = message
-				r.R2 = err
+					r = ResponseMessage{}
+					r.R6 = message
+					r.R2 = err
+				default:
+					r = ResponseMessage{}
+					r.R2 = fmt.Errorf("not implemented")
+				}
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			case OperationGetUserProfilePhotos:
