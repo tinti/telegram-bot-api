@@ -10,6 +10,10 @@ import (
 	"github.com/streadway/amqp"
 )
 
+const (
+	RandomStringLength = 32
+)
+
 func randomString(l int) string {
 	bytes := make([]byte, l)
 	for i := 0; i < l; i++ {
@@ -20,13 +24,6 @@ func randomString(l int) string {
 
 func randInt(min int, max int) int {
 	return min + rand.Intn(max-min)
-}
-
-func failOnError(err error, msg string) {
-	if err != nil {
-		log.Printf("%s: %s", msg, err)
-		panic(fmt.Sprintf("%s: %s", msg, err))
-	}
 }
 
 type BotAPIIface interface {
@@ -189,7 +186,35 @@ func RequestMessageUnmarshal(data []byte) (*RequestMessage, error) {
 		if _, ok := err.(*json.UnmarshalTypeError); ok {
 			// Type map
 			typeMap := map[string]reflect.Type{
-				"tgbotapi.MessageConfig": reflect.TypeOf(MessageConfig{}),
+				"tgbotapi.MessageConfig":                reflect.TypeOf(MessageConfig{}),
+				"tgbotapi.ForwardConfig":                reflect.TypeOf(ForwardConfig{}),
+				"tgbotapi.PhotoConfig":                  reflect.TypeOf(PhotoConfig{}),
+				"tgbotapi.AudioConfig":                  reflect.TypeOf(AudioConfig{}),
+				"tgbotapi.DocumentConfig":               reflect.TypeOf(DocumentConfig{}),
+				"tgbotapi.StickerConfig":                reflect.TypeOf(StickerConfig{}),
+				"tgbotapi.VideoConfig":                  reflect.TypeOf(VideoConfig{}),
+				"tgbotapi.AnimationConfig":              reflect.TypeOf(AnimationConfig{}),
+				"tgbotapi.VideoNoteConfig":              reflect.TypeOf(VideoNoteConfig{}),
+				"tgbotapi.VoiceConfig":                  reflect.TypeOf(VoiceConfig{}),
+				"tgbotapi.MediaGroupConfig":             reflect.TypeOf(MediaGroupConfig{}),
+				"tgbotapi.LocationConfig":               reflect.TypeOf(LocationConfig{}),
+				"tgbotapi.VenueConfig":                  reflect.TypeOf(VenueConfig{}),
+				"tgbotapi.ContactConfig":                reflect.TypeOf(ContactConfig{}),
+				"tgbotapi.GameConfig":                   reflect.TypeOf(GameConfig{}),
+				"tgbotapi.SetGameScoreConfig":           reflect.TypeOf(SetGameScoreConfig{}),
+				"tgbotapi.GetGameHighScoresConfig":      reflect.TypeOf(GetGameHighScoresConfig{}),
+				"tgbotapi.ChatActionConfig":             reflect.TypeOf(ChatActionConfig{}),
+				"tgbotapi.EditMessageTextConfig":        reflect.TypeOf(EditMessageTextConfig{}),
+				"tgbotapi.EditMessageCaptionConfig":     reflect.TypeOf(EditMessageCaptionConfig{}),
+				"tgbotapi.EditMessageReplyMarkupConfig": reflect.TypeOf(EditMessageReplyMarkupConfig{}),
+				"tgbotapi.InvoiceConfig":                reflect.TypeOf(InvoiceConfig{}),
+				"tgbotapi.DeleteMessageConfig":          reflect.TypeOf(DeleteMessageConfig{}),
+				"tgbotapi.PinChatMessageConfig":         reflect.TypeOf(PinChatMessageConfig{}),
+				"tgbotapi.UnpinChatMessageConfig":       reflect.TypeOf(UnpinChatMessageConfig{}),
+				"tgbotapi.SetChatTitleConfig":           reflect.TypeOf(SetChatTitleConfig{}),
+				"tgbotapi.SetChatDescriptionConfig":     reflect.TypeOf(SetChatDescriptionConfig{}),
+				"tgbotapi.SetChatPhotoConfig":           reflect.TypeOf(SetChatPhotoConfig{}),
+				"tgbotapi.DeleteChatPhotoConfig":        reflect.TypeOf(DeleteChatPhotoConfig{}),
 			}
 
 			// Unmarshal raw
@@ -311,17 +336,48 @@ type ResponseMessage struct {
 	R16 []GameHighScore
 }
 
-type ResponseMessageErrorString struct {
+type ErrorString struct {
 	s string
 }
 
+func (e *ErrorString) Error() string {
+	return e.s
+}
+
+func convertToErrorString(e error) error {
+	if e != nil {
+		return &ErrorString{e.Error()}
+	}
+
+	return nil
+}
+
+type ErrorRemoteBot struct {
+	s string
+	i error
+}
+
+func (e *ErrorRemoteBot) Error() string {
+	if e.i != nil {
+		return fmt.Sprintf("%s: %s", e.s, e.i)
+	}
+
+	return e.s
+}
+
+func convertToErrorRemoteBot(s string, e error) error {
+	return &ErrorRemoteBot{s, e}
+}
+
 func ResponseMessageUnmarshal(data []byte) (*ResponseMessage, error) {
+
 	n := ResponseMessage{}
 	if err := json.Unmarshal(data, &n); err != nil {
 		if _, ok := err.(*json.UnmarshalTypeError); ok {
 			// Type map
 			typeMap := map[string]reflect.Type{
-				"errors.errorString": reflect.TypeOf(ResponseMessageErrorString{}),
+				"*errors.errorString":   reflect.TypeOf(ErrorString{}),
+				"*tgbotapi.ErrorString": reflect.TypeOf(ErrorString{}),
 			}
 
 			// Unmarshal raw
@@ -396,19 +452,15 @@ func RemoteBotDial(url string) (*RemoteBotAPI, error) {
 }
 
 func RemoteBotClose(rbot *RemoteBotAPI) {
-	defer rbot.Connection.Close()
+	rbot.Connection.Close()
 }
 
 type RemoteBotAPI struct {
 	Connection *amqp.Connection
 }
 
-func (rbot *RemoteBotAPI) MakeRequest(endpoint string, params url.Values) (APIResponse, error) {
-	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
-	defer ch.Close()
-
-	q, err := ch.QueueDeclare(
+func hChannelQueueDeclare(ch *amqp.Channel) (amqp.Queue, error) {
+	return ch.QueueDeclare(
 		"",    // name
 		false, // durable
 		false, // delete when usused
@@ -416,28 +468,22 @@ func (rbot *RemoteBotAPI) MakeRequest(endpoint string, params url.Values) (APIRe
 		false, // no-wait
 		nil,   // arguments
 	)
-	failOnError(err, "Failed to declare a queue")
+}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
+func hChannelConsume(ch *amqp.Channel, name string) (<-chan amqp.Delivery, error) {
+	return ch.Consume(
+		name,  // queue
+		"",    // consumer
+		true,  // auto-ack
+		false, // exclusive
+		false, // no-local
+		false, // no-wait
+		nil,   // args
 	)
-	failOnError(err, "Failed to register a consumer")
+}
 
-	requestMessage := RequestMessage{
-		Operation:     OperationMakeRequest,
-		CorrelationId: randomString(32),
-		Endpoint:      endpoint,
-		Params:        params,
-	}
-	request, _ := json.Marshal(requestMessage)
-
-	err = ch.Publish(
+func hChannelPublish(ch *amqp.Channel, requestMessage *RequestMessage, name string, request []byte) error {
+	return ch.Publish(
 		"",         // exchange
 		"tgbotapi", // routing key
 		false,      // mandatory
@@ -445,16 +491,50 @@ func (rbot *RemoteBotAPI) MakeRequest(endpoint string, params url.Values) (APIRe
 		amqp.Publishing{
 			ContentType:   "text/plain",
 			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
+			ReplyTo:       name,
+			Body:          request,
 		})
-	failOnError(err, "Failed to publish a message")
+}
+
+func (rbot *RemoteBotAPI) MakeRequest(endpoint string, params url.Values) (APIResponse, error) {
+	var result APIResponse
+
+	ch, err := rbot.Connection.Channel()
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to open a channel", err)
+	}
+	defer ch.Close()
+
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+	}
+
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+	}
+
+	requestMessage := RequestMessage{
+		Operation:     OperationMakeRequest,
+		CorrelationId: randomString(RandomStringLength),
+		Endpoint:      endpoint,
+		Params:        params,
+	}
+	request, _ := json.Marshal(requestMessage)
+
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to publish a message", err)
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			}
 			response = *rP
 			break
 		}
@@ -464,34 +544,27 @@ func (rbot *RemoteBotAPI) MakeRequest(endpoint string, params url.Values) (APIRe
 }
 
 func (rbot *RemoteBotAPI) UploadFile(endpoint string, params2 map[string]string, fieldname string, file interface{}) (APIResponse, error) {
+	var result APIResponse
+
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to open a channel", err)
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationUploadFile,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 		Endpoint:      endpoint,
 		Params2:       params2,
 		Fieldname:     fieldname,
@@ -499,24 +572,18 @@ func (rbot *RemoteBotAPI) UploadFile(endpoint string, params2 map[string]string,
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to publish a message", err)
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			}
 			response = *rP
 			break
 		}
@@ -526,56 +593,43 @@ func (rbot *RemoteBotAPI) UploadFile(endpoint string, params2 map[string]string,
 }
 
 func (rbot *RemoteBotAPI) GetFileDirectURL(fileID string) (string, error) {
+	var result string
+
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to open a channel", err)
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationGetFileDirectURL,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 		FileID:        fileID,
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to publish a message", err)
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			}
 			response = *rP
 			break
 		}
@@ -585,55 +639,42 @@ func (rbot *RemoteBotAPI) GetFileDirectURL(fileID string) (string, error) {
 }
 
 func (rbot *RemoteBotAPI) GetMe() (User, error) {
+	var result User
+
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to open a channel", err)
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationGetMe,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to publish a message", err)
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			}
 			response = *rP
 			break
 		}
@@ -644,55 +685,45 @@ func (rbot *RemoteBotAPI) GetMe() (User, error) {
 
 func (rbot *RemoteBotAPI) IsMessageToMe(message Message) bool {
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		//return result, convertToErrorRemoteBot("Failed to open a channel", err)
+		return false
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		//return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+		return false
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		//return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+		return false
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationIsMessageToMe,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 		Message:       message,
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		//return result, convertToErrorRemoteBot("Failed to publish a message", err)
+		return false
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				//return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+				return false
+			}
 			response = *rP
 			break
 		}
@@ -701,60 +732,45 @@ func (rbot *RemoteBotAPI) IsMessageToMe(message Message) bool {
 	return response.R5
 }
 
-func (rbot *RemoteBotAPI) Send(c Chattable) (Message, error) {
+func (rbot *RemoteBotAPI) Send(c Chattable) (result Message, err error) {
 	cType := reflect.TypeOf(c).String()
 
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to open a channel", err)
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationSend,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 		C:             c,
 		CType:         cType,
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to publish a message", err)
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			}
 			response = *rP
 			break
 		}
@@ -764,56 +780,43 @@ func (rbot *RemoteBotAPI) Send(c Chattable) (Message, error) {
 }
 
 func (rbot *RemoteBotAPI) GetUserProfilePhotos(config UserProfilePhotosConfig) (UserProfilePhotos, error) {
+	var result UserProfilePhotos
+
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to open a channel", err)
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationGetUserProfilePhotos,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 		Config:        config,
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to publish a message", err)
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			}
 			response = *rP
 			break
 		}
@@ -823,56 +826,43 @@ func (rbot *RemoteBotAPI) GetUserProfilePhotos(config UserProfilePhotosConfig) (
 }
 
 func (rbot *RemoteBotAPI) GetFile(config2 FileConfig) (File, error) {
+	var result File
+
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to open a channel", err)
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationGetFile,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 		Config2:       config2,
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to publish a message", err)
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			}
 			response = *rP
 			break
 		}
@@ -882,56 +872,43 @@ func (rbot *RemoteBotAPI) GetFile(config2 FileConfig) (File, error) {
 }
 
 func (rbot *RemoteBotAPI) GetUpdates(config3 UpdateConfig) ([]Update, error) {
+	var result []Update
+
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to open a channel", err)
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationGetUpdates,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 		Config3:       config3,
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to publish a message", err)
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			}
 			response = *rP
 			break
 		}
@@ -941,55 +918,42 @@ func (rbot *RemoteBotAPI) GetUpdates(config3 UpdateConfig) ([]Update, error) {
 }
 
 func (rbot *RemoteBotAPI) RemoveWebhook() (APIResponse, error) {
+	var result APIResponse
+
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to open a channel", err)
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationRemoveWebhook,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to publish a message", err)
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			}
 			response = *rP
 			break
 		}
@@ -999,56 +963,43 @@ func (rbot *RemoteBotAPI) RemoveWebhook() (APIResponse, error) {
 }
 
 func (rbot *RemoteBotAPI) SetWebhook(config4 WebhookConfig) (APIResponse, error) {
+	var result APIResponse
+
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to open a channel", err)
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationSetWebhook,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 		Config4:       config4,
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to publish a message", err)
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			}
 			response = *rP
 			break
 		}
@@ -1058,55 +1009,42 @@ func (rbot *RemoteBotAPI) SetWebhook(config4 WebhookConfig) (APIResponse, error)
 }
 
 func (rbot *RemoteBotAPI) GetWebhookInfo() (WebhookInfo, error) {
+	var result WebhookInfo
+
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to open a channel", err)
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationGetWebhookInfo,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to publish a message", err)
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			}
 			response = *rP
 			break
 		}
@@ -1116,56 +1054,43 @@ func (rbot *RemoteBotAPI) GetWebhookInfo() (WebhookInfo, error) {
 }
 
 func (rbot *RemoteBotAPI) GetUpdatesChan(config3 UpdateConfig) (UpdatesChannel, error) {
+	var result UpdatesChannel
+
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to open a channel", err)
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationGetUpdatesChan,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 		Config3:       config3,
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to publish a message", err)
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			}
 			response = *rP
 			break
 		}
@@ -1176,116 +1101,94 @@ func (rbot *RemoteBotAPI) GetUpdatesChan(config3 UpdateConfig) (UpdatesChannel, 
 }
 
 func (rbot *RemoteBotAPI) ListenForWebhook(pattern string) UpdatesChannel {
+	c := make(UpdatesChannel)
+
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		//return result, convertToErrorRemoteBot("Failed to open a channel", err)
+		return c
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		//return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+		return c
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		//return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+		return c
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationListenForWebhook,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 		Pattern:       pattern,
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		//return result, convertToErrorRemoteBot("Failed to publish a message", err)
+		return c
+	}
 
 	//var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			//rP, err := ResponseMessageUnmarshal(d.Body)
-			//failOnError(err, "Failed to convert body to response")
+			//if err != nil {
+			//	//return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			//      return c
+			//}
 			//response = *rP
 			break
 		}
 	}
 
-	c := make(UpdatesChannel)
 	return c
 }
 
 func (rbot *RemoteBotAPI) AnswerInlineQuery(config5 InlineConfig) (APIResponse, error) {
+	var result APIResponse
+
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to open a channel", err)
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationAnswerInlineQuery,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 		Config5:       config5,
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to publish a message", err)
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			}
 			response = *rP
 			break
 		}
@@ -1295,56 +1198,43 @@ func (rbot *RemoteBotAPI) AnswerInlineQuery(config5 InlineConfig) (APIResponse, 
 }
 
 func (rbot *RemoteBotAPI) AnswerCallbackQuery(config6 CallbackConfig) (APIResponse, error) {
+	var result APIResponse
+
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to open a channel", err)
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationAnswerCallbackQuery,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 		Config6:       config6,
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to publish a message", err)
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			}
 			response = *rP
 			break
 		}
@@ -1354,56 +1244,43 @@ func (rbot *RemoteBotAPI) AnswerCallbackQuery(config6 CallbackConfig) (APIRespon
 }
 
 func (rbot *RemoteBotAPI) KickChatMember(config7 KickChatMemberConfig) (APIResponse, error) {
+	var result APIResponse
+
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to open a channel", err)
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationKickChatMember,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 		Config7:       config7,
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to publish a message", err)
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			}
 			response = *rP
 			break
 		}
@@ -1413,56 +1290,43 @@ func (rbot *RemoteBotAPI) KickChatMember(config7 KickChatMemberConfig) (APIRespo
 }
 
 func (rbot *RemoteBotAPI) LeaveChat(config8 ChatConfig) (APIResponse, error) {
+	var result APIResponse
+
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to open a channel", err)
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationLeaveChat,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 		Config8:       config8,
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to publish a message", err)
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			}
 			response = *rP
 			break
 		}
@@ -1472,56 +1336,43 @@ func (rbot *RemoteBotAPI) LeaveChat(config8 ChatConfig) (APIResponse, error) {
 }
 
 func (rbot *RemoteBotAPI) GetChat(config8 ChatConfig) (Chat, error) {
+	var result Chat
+
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to open a channel", err)
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationGetChat,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 		Config8:       config8,
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to publish a message", err)
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			}
 			response = *rP
 			break
 		}
@@ -1531,56 +1382,43 @@ func (rbot *RemoteBotAPI) GetChat(config8 ChatConfig) (Chat, error) {
 }
 
 func (rbot *RemoteBotAPI) GetChatAdministrators(config8 ChatConfig) ([]ChatMember, error) {
+	var result []ChatMember
+
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to open a channel", err)
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationGetChatAdministrators,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 		Config8:       config8,
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to publish a message", err)
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			}
 			response = *rP
 			break
 		}
@@ -1590,56 +1428,43 @@ func (rbot *RemoteBotAPI) GetChatAdministrators(config8 ChatConfig) ([]ChatMembe
 }
 
 func (rbot *RemoteBotAPI) GetChatMembersCount(config8 ChatConfig) (int, error) {
+	var result int
+
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to open a channel", err)
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationGetChatMembersCount,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 		Config8:       config8,
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to publish a message", err)
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			}
 			response = *rP
 			break
 		}
@@ -1649,56 +1474,43 @@ func (rbot *RemoteBotAPI) GetChatMembersCount(config8 ChatConfig) (int, error) {
 }
 
 func (rbot *RemoteBotAPI) GetChatMember(config9 ChatConfigWithUser) (ChatMember, error) {
+	var result ChatMember
+
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to open a channel", err)
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationGetChatMember,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 		Config9:       config9,
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to publish a message", err)
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			}
 			response = *rP
 			break
 		}
@@ -1708,56 +1520,43 @@ func (rbot *RemoteBotAPI) GetChatMember(config9 ChatConfigWithUser) (ChatMember,
 }
 
 func (rbot *RemoteBotAPI) UnbanChatMember(config10 ChatMemberConfig) (APIResponse, error) {
+	var result APIResponse
+
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to open a channel", err)
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationUnbanChatMember,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 		Config10:      config10,
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to publish a message", err)
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			}
 			response = *rP
 			break
 		}
@@ -1767,56 +1566,43 @@ func (rbot *RemoteBotAPI) UnbanChatMember(config10 ChatMemberConfig) (APIRespons
 }
 
 func (rbot *RemoteBotAPI) RestrictChatMember(config11 RestrictChatMemberConfig) (APIResponse, error) {
+	var result APIResponse
+
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to open a channel", err)
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationRestrictChatMember,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 		Config11:      config11,
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to publish a message", err)
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			}
 			response = *rP
 			break
 		}
@@ -1826,56 +1612,43 @@ func (rbot *RemoteBotAPI) RestrictChatMember(config11 RestrictChatMemberConfig) 
 }
 
 func (rbot *RemoteBotAPI) PromoteChatMember(config12 PromoteChatMemberConfig) (APIResponse, error) {
+	var result APIResponse
+
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to open a channel", err)
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationPromoteChatMember,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 		Config12:      config12,
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to publish a message", err)
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			}
 			response = *rP
 			break
 		}
@@ -1885,56 +1658,43 @@ func (rbot *RemoteBotAPI) PromoteChatMember(config12 PromoteChatMemberConfig) (A
 }
 
 func (rbot *RemoteBotAPI) GetGameHighScores(config13 GetGameHighScoresConfig) ([]GameHighScore, error) {
+	var result []GameHighScore
+
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to open a channel", err)
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationGetGameHighScores,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 		Config13:      config13,
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to publish a message", err)
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			}
 			response = *rP
 			break
 		}
@@ -1944,56 +1704,43 @@ func (rbot *RemoteBotAPI) GetGameHighScores(config13 GetGameHighScoresConfig) ([
 }
 
 func (rbot *RemoteBotAPI) AnswerShippingQuery(config14 ShippingConfig) (APIResponse, error) {
+	var result APIResponse
+
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to open a channel", err)
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationAnswerShippingQuery,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 		Config14:      config14,
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to publish a message", err)
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			}
 			response = *rP
 			break
 		}
@@ -2003,56 +1750,43 @@ func (rbot *RemoteBotAPI) AnswerShippingQuery(config14 ShippingConfig) (APIRespo
 }
 
 func (rbot *RemoteBotAPI) AnswerPreCheckoutQuery(config15 PreCheckoutConfig) (APIResponse, error) {
+	var result APIResponse
+
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to open a channel", err)
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationAnswerPreCheckoutQuery,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 		Config15:      config15,
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to publish a message", err)
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			}
 			response = *rP
 			break
 		}
@@ -2062,56 +1796,43 @@ func (rbot *RemoteBotAPI) AnswerPreCheckoutQuery(config15 PreCheckoutConfig) (AP
 }
 
 func (rbot *RemoteBotAPI) DeleteMessage(config16 DeleteMessageConfig) (APIResponse, error) {
+	var result APIResponse
+
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to open a channel", err)
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationDeleteMessage,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 		Config16:      config16,
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to publish a message", err)
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			}
 			response = *rP
 			break
 		}
@@ -2121,56 +1842,43 @@ func (rbot *RemoteBotAPI) DeleteMessage(config16 DeleteMessageConfig) (APIRespon
 }
 
 func (rbot *RemoteBotAPI) GetInviteLink(config8 ChatConfig) (string, error) {
+	var result string
+
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to open a channel", err)
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationGetInviteLink,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 		Config8:       config8,
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to publish a message", err)
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			}
 			response = *rP
 			break
 		}
@@ -2180,56 +1888,43 @@ func (rbot *RemoteBotAPI) GetInviteLink(config8 ChatConfig) (string, error) {
 }
 
 func (rbot *RemoteBotAPI) PinChatMessage(config17 PinChatMessageConfig) (APIResponse, error) {
+	var result APIResponse
+
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to open a channel", err)
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationPinChatMessage,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 		Config17:      config17,
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to publish a message", err)
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			}
 			response = *rP
 			break
 		}
@@ -2239,56 +1934,43 @@ func (rbot *RemoteBotAPI) PinChatMessage(config17 PinChatMessageConfig) (APIResp
 }
 
 func (rbot *RemoteBotAPI) UnpinChatMessage(config18 UnpinChatMessageConfig) (APIResponse, error) {
+	var result APIResponse
+
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to open a channel", err)
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationUnpinChatMessage,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 		Config18:      config18,
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to publish a message", err)
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			}
 			response = *rP
 			break
 		}
@@ -2298,56 +1980,43 @@ func (rbot *RemoteBotAPI) UnpinChatMessage(config18 UnpinChatMessageConfig) (API
 }
 
 func (rbot *RemoteBotAPI) SetChatTitle(config19 SetChatTitleConfig) (APIResponse, error) {
+	var result APIResponse
+
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to open a channel", err)
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationSetChatTitle,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 		Config19:      config19,
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to publish a message", err)
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			}
 			response = *rP
 			break
 		}
@@ -2357,56 +2026,43 @@ func (rbot *RemoteBotAPI) SetChatTitle(config19 SetChatTitleConfig) (APIResponse
 }
 
 func (rbot *RemoteBotAPI) SetChatDescription(config20 SetChatDescriptionConfig) (APIResponse, error) {
+	var result APIResponse
+
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to open a channel", err)
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationSetChatDescription,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 		Config20:      config20,
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to publish a message", err)
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			}
 			response = *rP
 			break
 		}
@@ -2416,56 +2072,43 @@ func (rbot *RemoteBotAPI) SetChatDescription(config20 SetChatDescriptionConfig) 
 }
 
 func (rbot *RemoteBotAPI) SetChatPhoto(config21 SetChatPhotoConfig) (APIResponse, error) {
+	var result APIResponse
+
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to open a channel", err)
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationSetChatPhoto,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 		Config21:      config21,
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to publish a message", err)
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			}
 			response = *rP
 			break
 		}
@@ -2475,56 +2118,43 @@ func (rbot *RemoteBotAPI) SetChatPhoto(config21 SetChatPhotoConfig) (APIResponse
 }
 
 func (rbot *RemoteBotAPI) DeleteChatPhoto(config22 DeleteChatPhotoConfig) (APIResponse, error) {
+	var result APIResponse
+
 	ch, err := rbot.Connection.Channel()
-	failOnError(err, "Failed to open a channel")
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to open a channel", err)
+	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		"",    // name
-		false, // durable
-		false, // delete when usused
-		true,  // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	failOnError(err, "Failed to declare a queue")
+	q, err := hChannelQueueDeclare(ch)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to declare a queue", err)
+	}
 
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	failOnError(err, "Failed to register a consumer")
+	msgs, err := hChannelConsume(ch, q.Name)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to register a consumer", err)
+	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationDeleteChatPhoto,
-		CorrelationId: randomString(32),
+		CorrelationId: randomString(RandomStringLength),
 		Config22:      config22,
 	}
 	request, _ := json.Marshal(requestMessage)
 
-	err = ch.Publish(
-		"",         // exchange
-		"tgbotapi", // routing key
-		false,      // mandatory
-		false,      // immediate
-		amqp.Publishing{
-			ContentType:   "text/plain",
-			CorrelationId: requestMessage.CorrelationId,
-			ReplyTo:       q.Name,
-			Body:          []byte(request),
-		})
-	failOnError(err, "Failed to publish a message")
+	err = hChannelPublish(ch, &requestMessage, q.Name, request)
+	if err != nil {
+		return result, convertToErrorRemoteBot("Failed to publish a message", err)
+	}
 
 	var response ResponseMessage
 	for d := range msgs {
 		if requestMessage.CorrelationId == d.CorrelationId {
 			rP, err := ResponseMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to response")
+			if err != nil {
+				return result, convertToErrorRemoteBot("Failed to convert body to response", err)
+			}
 			response = *rP
 			break
 		}
@@ -2535,11 +2165,14 @@ func (rbot *RemoteBotAPI) DeleteChatPhoto(config22 DeleteChatPhotoConfig) (APIRe
 
 func SimpleServer(url string, bot *BotAPI) {
 	conn, err := amqp.Dial(url)
-	failOnError(err, "Failed to connect to RabbitMQ")
+	if err != nil {
+		panic(err)
+	}
+	//failOnError(err, "Failed to connect to RabbitMQ")
 	defer conn.Close()
 
 	ch, err := conn.Channel()
-	failOnError(err, "Failed to open a channel")
+	//failOnError(err, "Failed to open a channel")
 	defer ch.Close()
 
 	q, err := ch.QueueDeclare(
@@ -2550,14 +2183,14 @@ func SimpleServer(url string, bot *BotAPI) {
 		false,      // no-wait
 		nil,        // arguments
 	)
-	failOnError(err, "Failed to declare a queue")
+	//failOnError(err, "Failed to declare a queue")
 
 	err = ch.Qos(
 		1,     // prefetch count
 		0,     // prefetch size
 		false, // global
 	)
-	failOnError(err, "Failed to set QoS")
+	//failOnError(err, "Failed to set QoS")
 
 	msgs, err := ch.Consume(
 		q.Name, // queue
@@ -2568,14 +2201,17 @@ func SimpleServer(url string, bot *BotAPI) {
 		false,  // no-wait
 		nil,    // args
 	)
-	failOnError(err, "Failed to register a consumer")
+	//failOnError(err, "Failed to register a consumer")
 
 	forever := make(chan bool)
 
 	go func() {
 		for d := range msgs {
 			nP, err := RequestMessageUnmarshal(d.Body)
-			failOnError(err, "Failed to convert body to request")
+			//failOnError(err, "Failed to convert body to request")
+			if err != nil {
+				panic(err)
+			}
 			n := *nP
 
 			var r ResponseMessage
@@ -2585,7 +2221,7 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r = ResponseMessage{}
 				r.R = apiResponse
-				r.R2 = err
+				r.R2 = convertToErrorString(err)
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			case OperationUploadFile:
@@ -2593,7 +2229,7 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r = ResponseMessage{}
 				r.R = apiResponse
-				r.R2 = err
+				r.R2 = convertToErrorString(err)
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			case OperationGetFileDirectURL:
@@ -2601,7 +2237,7 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r = ResponseMessage{}
 				r.R3 = fileID
-				r.R2 = err
+				r.R2 = convertToErrorString(err)
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			case OperationGetMe:
@@ -2609,7 +2245,7 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r = ResponseMessage{}
 				r.R4 = user
-				r.R2 = err
+				r.R2 = convertToErrorString(err)
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			case OperationIsMessageToMe:
@@ -2627,7 +2263,203 @@ func SimpleServer(url string, bot *BotAPI) {
 
 					r = ResponseMessage{}
 					r.R6 = message
-					r.R2 = err
+					r.R2 = convertToErrorString(err)
+				case reflect.TypeOf(ForwardConfig{}).String():
+					m := n.C.(*ForwardConfig)
+					message, err := bot.Send(m)
+
+					r = ResponseMessage{}
+					r.R6 = message
+					r.R2 = convertToErrorString(err)
+				case reflect.TypeOf(PhotoConfig{}).String():
+					m := n.C.(*PhotoConfig)
+					message, err := bot.Send(m)
+
+					r = ResponseMessage{}
+					r.R6 = message
+					r.R2 = convertToErrorString(err)
+				case reflect.TypeOf(AudioConfig{}).String():
+					m := n.C.(*AudioConfig)
+					message, err := bot.Send(m)
+
+					r = ResponseMessage{}
+					r.R6 = message
+					r.R2 = convertToErrorString(err)
+				case reflect.TypeOf(DocumentConfig{}).String():
+					m := n.C.(*DocumentConfig)
+					message, err := bot.Send(m)
+
+					r = ResponseMessage{}
+					r.R6 = message
+					r.R2 = convertToErrorString(err)
+				case reflect.TypeOf(StickerConfig{}).String():
+					m := n.C.(*StickerConfig)
+					message, err := bot.Send(m)
+
+					r = ResponseMessage{}
+					r.R6 = message
+					r.R2 = convertToErrorString(err)
+				case reflect.TypeOf(VideoConfig{}).String():
+					m := n.C.(*VideoConfig)
+					message, err := bot.Send(m)
+
+					r = ResponseMessage{}
+					r.R6 = message
+					r.R2 = convertToErrorString(err)
+				case reflect.TypeOf(AnimationConfig{}).String():
+					m := n.C.(*AnimationConfig)
+					message, err := bot.Send(m)
+
+					r = ResponseMessage{}
+					r.R6 = message
+					r.R2 = convertToErrorString(err)
+				case reflect.TypeOf(VideoNoteConfig{}).String():
+					m := n.C.(*VideoNoteConfig)
+					message, err := bot.Send(m)
+
+					r = ResponseMessage{}
+					r.R6 = message
+					r.R2 = convertToErrorString(err)
+				case reflect.TypeOf(VoiceConfig{}).String():
+					m := n.C.(*VoiceConfig)
+					message, err := bot.Send(m)
+
+					r = ResponseMessage{}
+					r.R6 = message
+					r.R2 = convertToErrorString(err)
+				case reflect.TypeOf(MediaGroupConfig{}).String():
+					m := n.C.(*MediaGroupConfig)
+					message, err := bot.Send(m)
+
+					r = ResponseMessage{}
+					r.R6 = message
+					r.R2 = convertToErrorString(err)
+				case reflect.TypeOf(LocationConfig{}).String():
+					m := n.C.(*LocationConfig)
+					message, err := bot.Send(m)
+
+					r = ResponseMessage{}
+					r.R6 = message
+					r.R2 = convertToErrorString(err)
+				case reflect.TypeOf(VenueConfig{}).String():
+					m := n.C.(*VenueConfig)
+					message, err := bot.Send(m)
+
+					r = ResponseMessage{}
+					r.R6 = message
+					r.R2 = convertToErrorString(err)
+				case reflect.TypeOf(ContactConfig{}).String():
+					m := n.C.(*ContactConfig)
+					message, err := bot.Send(m)
+
+					r = ResponseMessage{}
+					r.R6 = message
+					r.R2 = convertToErrorString(err)
+				case reflect.TypeOf(GameConfig{}).String():
+					m := n.C.(*GameConfig)
+					message, err := bot.Send(m)
+
+					r = ResponseMessage{}
+					r.R6 = message
+					r.R2 = convertToErrorString(err)
+				case reflect.TypeOf(SetGameScoreConfig{}).String():
+					m := n.C.(*SetGameScoreConfig)
+					message, err := bot.Send(m)
+
+					r = ResponseMessage{}
+					r.R6 = message
+					r.R2 = convertToErrorString(err)
+				case reflect.TypeOf(GetGameHighScoresConfig{}).String():
+					m := n.C.(*GetGameHighScoresConfig)
+					message, err := bot.Send(m)
+
+					r = ResponseMessage{}
+					r.R6 = message
+					r.R2 = convertToErrorString(err)
+				case reflect.TypeOf(ChatActionConfig{}).String():
+					m := n.C.(*ChatActionConfig)
+					message, err := bot.Send(m)
+
+					r = ResponseMessage{}
+					r.R6 = message
+					r.R2 = convertToErrorString(err)
+				case reflect.TypeOf(EditMessageTextConfig{}).String():
+					m := n.C.(*EditMessageTextConfig)
+					message, err := bot.Send(m)
+
+					r = ResponseMessage{}
+					r.R6 = message
+					r.R2 = convertToErrorString(err)
+				case reflect.TypeOf(EditMessageCaptionConfig{}).String():
+					m := n.C.(*EditMessageCaptionConfig)
+					message, err := bot.Send(m)
+
+					r = ResponseMessage{}
+					r.R6 = message
+					r.R2 = convertToErrorString(err)
+				case reflect.TypeOf(EditMessageReplyMarkupConfig{}).String():
+					m := n.C.(*EditMessageReplyMarkupConfig)
+					message, err := bot.Send(m)
+
+					r = ResponseMessage{}
+					r.R6 = message
+					r.R2 = convertToErrorString(err)
+				case reflect.TypeOf(InvoiceConfig{}).String():
+					m := n.C.(*InvoiceConfig)
+					message, err := bot.Send(m)
+
+					r = ResponseMessage{}
+					r.R6 = message
+					r.R2 = convertToErrorString(err)
+				case reflect.TypeOf(DeleteMessageConfig{}).String():
+					m := n.C.(*DeleteMessageConfig)
+					message, err := bot.Send(m)
+
+					r = ResponseMessage{}
+					r.R6 = message
+					r.R2 = convertToErrorString(err)
+				case reflect.TypeOf(PinChatMessageConfig{}).String():
+					m := n.C.(*PinChatMessageConfig)
+					message, err := bot.Send(m)
+
+					r = ResponseMessage{}
+					r.R6 = message
+					r.R2 = convertToErrorString(err)
+				case reflect.TypeOf(UnpinChatMessageConfig{}).String():
+					m := n.C.(*UnpinChatMessageConfig)
+					message, err := bot.Send(m)
+
+					r = ResponseMessage{}
+					r.R6 = message
+					r.R2 = convertToErrorString(err)
+				case reflect.TypeOf(SetChatTitleConfig{}).String():
+					m := n.C.(*SetChatTitleConfig)
+					message, err := bot.Send(m)
+
+					r = ResponseMessage{}
+					r.R6 = message
+					r.R2 = convertToErrorString(err)
+				case reflect.TypeOf(SetChatDescriptionConfig{}).String():
+					m := n.C.(*SetChatDescriptionConfig)
+					message, err := bot.Send(m)
+
+					r = ResponseMessage{}
+					r.R6 = message
+					r.R2 = convertToErrorString(err)
+				case reflect.TypeOf(SetChatPhotoConfig{}).String():
+					m := n.C.(*SetChatPhotoConfig)
+					message, err := bot.Send(m)
+
+					r = ResponseMessage{}
+					r.R6 = message
+					r.R2 = convertToErrorString(err)
+				case reflect.TypeOf(DeleteChatPhotoConfig{}).String():
+					m := n.C.(*DeleteChatPhotoConfig)
+					message, err := bot.Send(m)
+
+					r = ResponseMessage{}
+					r.R6 = message
+					r.R2 = convertToErrorString(err)
 				default:
 					r = ResponseMessage{}
 					r.R2 = fmt.Errorf("not implemented")
@@ -2639,7 +2471,7 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r = ResponseMessage{}
 				r.R7 = userProfilePhotos
-				r.R2 = err
+				r.R2 = convertToErrorString(err)
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			case OperationGetFile:
@@ -2647,7 +2479,7 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r = ResponseMessage{}
 				r.R8 = file
-				r.R2 = err
+				r.R2 = convertToErrorString(err)
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			case OperationGetUpdates:
@@ -2655,7 +2487,7 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r = ResponseMessage{}
 				r.R9 = updates
-				r.R2 = err
+				r.R2 = convertToErrorString(err)
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			case OperationRemoveWebhook:
@@ -2663,7 +2495,7 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r = ResponseMessage{}
 				r.R = apiResponse
-				r.R2 = err
+				r.R2 = convertToErrorString(err)
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			case OperationSetWebhook:
@@ -2671,7 +2503,7 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r = ResponseMessage{}
 				r.R = apiResponse
-				r.R2 = err
+				r.R2 = convertToErrorString(err)
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			case OperationGetWebhookInfo:
@@ -2679,7 +2511,7 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r = ResponseMessage{}
 				r.R10 = webhookInfo
-				r.R2 = err
+				r.R2 = convertToErrorString(err)
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			case OperationGetUpdatesChan:
@@ -2697,7 +2529,7 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r = ResponseMessage{}
 				r.R = apiResponse
-				r.R2 = err
+				r.R2 = convertToErrorString(err)
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			case OperationAnswerCallbackQuery:
@@ -2705,7 +2537,7 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r = ResponseMessage{}
 				r.R = apiResponse
-				r.R2 = err
+				r.R2 = convertToErrorString(err)
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			case OperationKickChatMember:
@@ -2713,7 +2545,7 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r = ResponseMessage{}
 				r.R = apiResponse
-				r.R2 = err
+				r.R2 = convertToErrorString(err)
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			case OperationLeaveChat:
@@ -2721,7 +2553,7 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r = ResponseMessage{}
 				r.R = apiResponse
-				r.R2 = err
+				r.R2 = convertToErrorString(err)
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			case OperationGetChat:
@@ -2729,7 +2561,7 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r = ResponseMessage{}
 				r.R12 = chat
-				r.R2 = err
+				r.R2 = convertToErrorString(err)
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			case OperationGetChatAdministrators:
@@ -2737,7 +2569,7 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r = ResponseMessage{}
 				r.R13 = chatMembers
-				r.R2 = err
+				r.R2 = convertToErrorString(err)
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			case OperationGetChatMembersCount:
@@ -2745,7 +2577,7 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r = ResponseMessage{}
 				r.R14 = count
-				r.R2 = err
+				r.R2 = convertToErrorString(err)
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			case OperationGetChatMember:
@@ -2753,7 +2585,7 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r = ResponseMessage{}
 				r.R15 = chatMember
-				r.R2 = err
+				r.R2 = convertToErrorString(err)
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			case OperationUnbanChatMember:
@@ -2761,7 +2593,7 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r = ResponseMessage{}
 				r.R = apiResponse
-				r.R2 = err
+				r.R2 = convertToErrorString(err)
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			case OperationRestrictChatMember:
@@ -2769,7 +2601,7 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r = ResponseMessage{}
 				r.R = apiResponse
-				r.R2 = err
+				r.R2 = convertToErrorString(err)
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			case OperationPromoteChatMember:
@@ -2777,7 +2609,7 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r = ResponseMessage{}
 				r.R = apiResponse
-				r.R2 = err
+				r.R2 = convertToErrorString(err)
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			case OperationGetGameHighScores:
@@ -2785,7 +2617,7 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r = ResponseMessage{}
 				r.R16 = gameHighScores
-				r.R2 = err
+				r.R2 = convertToErrorString(err)
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			case OperationAnswerShippingQuery:
@@ -2793,7 +2625,7 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r = ResponseMessage{}
 				r.R = apiResponse
-				r.R2 = err
+				r.R2 = convertToErrorString(err)
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			case OperationAnswerPreCheckoutQuery:
@@ -2801,7 +2633,7 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r = ResponseMessage{}
 				r.R = apiResponse
-				r.R2 = err
+				r.R2 = convertToErrorString(err)
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			case OperationDeleteMessage:
@@ -2809,7 +2641,7 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r = ResponseMessage{}
 				r.R = apiResponse
-				r.R2 = err
+				r.R2 = convertToErrorString(err)
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			case OperationGetInviteLink:
@@ -2817,7 +2649,7 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r = ResponseMessage{}
 				r.R3 = link
-				r.R2 = err
+				r.R2 = convertToErrorString(err)
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			case OperationPinChatMessage:
@@ -2825,7 +2657,7 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r = ResponseMessage{}
 				r.R = apiResponse
-				r.R2 = err
+				r.R2 = convertToErrorString(err)
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			case OperationUnpinChatMessage:
@@ -2833,7 +2665,7 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r = ResponseMessage{}
 				r.R = apiResponse
-				r.R2 = err
+				r.R2 = convertToErrorString(err)
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			case OperationSetChatTitle:
@@ -2841,7 +2673,7 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r = ResponseMessage{}
 				r.R = apiResponse
-				r.R2 = err
+				r.R2 = convertToErrorString(err)
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			case OperationSetChatDescription:
@@ -2849,7 +2681,7 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r = ResponseMessage{}
 				r.R = apiResponse
-				r.R2 = err
+				r.R2 = convertToErrorString(err)
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			case OperationSetChatPhoto:
@@ -2857,7 +2689,7 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r = ResponseMessage{}
 				r.R = apiResponse
-				r.R2 = err
+				r.R2 = convertToErrorString(err)
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			case OperationDeleteChatPhoto:
@@ -2865,7 +2697,7 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r = ResponseMessage{}
 				r.R = apiResponse
-				r.R2 = err
+				r.R2 = convertToErrorString(err)
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			default:
@@ -2874,6 +2706,12 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			}
+
+			// Annotate R2Type if needed
+			if r.R2 != nil {
+				r.R2Type = reflect.TypeOf(r.R2).String()
+			}
+
 			response, _ := json.Marshal(r)
 
 			err = ch.Publish(
@@ -2884,9 +2722,9 @@ func SimpleServer(url string, bot *BotAPI) {
 				amqp.Publishing{
 					ContentType:   "text/plain",
 					CorrelationId: d.CorrelationId,
-					Body:          []byte(response),
+					Body:          response,
 				})
-			failOnError(err, "Failed to publish a message")
+			//failOnError(err, "Failed to publish a message")
 
 			d.Ack(false)
 		}
