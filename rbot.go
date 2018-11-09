@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"net/url"
 	"reflect"
+	"time"
 
 	"github.com/streadway/amqp"
 )
@@ -13,6 +14,7 @@ import (
 const (
 	RandomStringLength = 32
 	RoutingKey         = "tgbotapi"
+	DefaultTimeout     = 15 * time.Second
 )
 
 const (
@@ -346,6 +348,7 @@ func RemoteBotDial(url string) (*RemoteBotAPI, error) {
 
 	rbot := new(RemoteBotAPI)
 	rbot.Connection = conn
+	rbot.Timeout = DefaultTimeout
 
 	return rbot, nil
 }
@@ -356,6 +359,7 @@ func RemoteBotClose(rbot *RemoteBotAPI) {
 
 type RemoteBotAPI struct {
 	Connection *amqp.Connection
+	Timeout    time.Duration
 }
 
 func hChannelQueueDeclare(ch *amqp.Channel) (amqp.Queue, error) {
@@ -395,24 +399,103 @@ func hChannelPublish(ch *amqp.Channel, requestMessage *RequestMessage, name stri
 		})
 }
 
-func (rbot *RemoteBotAPI) MakeRequest(endpoint string, params url.Values) (APIResponse, error) {
-	var result APIResponse
-
-	ch, err := rbot.Connection.Channel()
+func hCreateChannelQueueDeclareConsume(connection *amqp.Connection) (*amqp.Channel, amqp.Queue, <-chan amqp.Delivery, error) {
+	ch, err := connection.Channel()
 	if err != nil {
-		return result, hNewErrorRemoteBot(FailedOpenChannel, err)
+		return nil, amqp.Queue{}, make(chan amqp.Delivery), hNewErrorRemoteBot(FailedOpenChannel, err)
 	}
-	defer ch.Close()
 
 	q, err := hChannelQueueDeclare(ch)
 	if err != nil {
-		return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
+		ch.Close()
+		return nil, amqp.Queue{}, make(chan amqp.Delivery), hNewErrorRemoteBot(FailedDeclareQueue, err)
 	}
 
 	msgs, err := hChannelConsume(ch, q.Name)
 	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessageConsume, err)
+		ch.Close()
+		return nil, amqp.Queue{}, make(chan amqp.Delivery), hNewErrorRemoteBot(FailedMessageConsume, err)
 	}
+
+	return ch, q, msgs, nil
+}
+
+func hChannelPublishWithTimeoutTicker(ch *amqp.Channel, requestMessage *RequestMessage, name string, request []byte, ticker *time.Ticker) error {
+	errChan := make(chan error, 1)
+
+	go func() {
+		errChan <- hChannelPublish(ch, requestMessage, name, request)
+	}()
+
+	select {
+	case err := <-errChan:
+		if err != nil {
+			return hNewErrorRemoteBot(FailedMessagePublish, err)
+		}
+	case <-ticker.C:
+		return hNewErrorRemoteBot(FailedMessagePublish, fmt.Errorf("timeout"))
+	}
+
+	return nil
+}
+
+func hChannelConsumeWithTimeoutTicker(correlationId string, msgs <-chan amqp.Delivery, ticker *time.Ticker) (*ResponseMessage, error) {
+	var response *ResponseMessage
+	errChan := make(chan error, 1)
+
+	go func() {
+		for d := range msgs {
+			if correlationId == d.CorrelationId {
+				r, err := ResponseMessageUnmarshal(d.Body)
+				response = r
+				errChan <- err
+				break
+			}
+		}
+	}()
+
+	select {
+	case err := <-errChan:
+		if err != nil {
+			return nil, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
+		}
+	case <-ticker.C:
+		return nil, hNewErrorRemoteBot(FailedMessageConsume, fmt.Errorf("timeout"))
+	}
+
+	return response, nil
+}
+
+func hChannelSerializePublishConsumeWithTimeoutTicker(ch *amqp.Channel, q amqp.Queue, msgs <-chan amqp.Delivery, requestMessage *RequestMessage, ticker *time.Ticker) (*ResponseMessage, error) {
+	request, err := json.Marshal(*requestMessage)
+	if err != nil {
+		panic(err)
+	}
+
+	remoteBotErr := hChannelPublishWithTimeoutTicker(ch, requestMessage, q.Name, request, ticker)
+	if remoteBotErr != nil {
+		return nil, remoteBotErr
+	}
+
+	response, remoteBotErr := hChannelConsumeWithTimeoutTicker(requestMessage.CorrelationId, msgs, ticker)
+	if remoteBotErr != nil {
+		return nil, remoteBotErr
+	}
+
+	return response, nil
+}
+
+func (rbot *RemoteBotAPI) MakeRequest(endpoint string, params url.Values) (APIResponse, error) {
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
+	var result APIResponse
+
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
+	}
+	defer ch.Close()
 
 	requestMessage := RequestMessage{
 		Operation:     OperationMakeRequest,
@@ -420,49 +503,26 @@ func (rbot *RemoteBotAPI) MakeRequest(endpoint string, params url.Values) (APIRe
 		Endpoint:      endpoint,
 		Params:        params,
 	}
-	request, err := json.Marshal(requestMessage)
-	if err != nil {
-		panic(err)
-	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-	}
-
-	var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			rP, err := ResponseMessageUnmarshal(d.Body)
-			if err != nil {
-				return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			}
-			response = *rP
-			break
-		}
+	response, remoteBotErr := hChannelSerializePublishConsumeWithTimeoutTicker(ch, q, msgs, &requestMessage, ticker)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 
 	return response.R, response.R2.toError()
 }
 
 func (rbot *RemoteBotAPI) UploadFile(endpoint string, params2 map[string]string, fieldname string, file interface{}) (APIResponse, error) {
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
 	var result APIResponse
 
-	ch, err := rbot.Connection.Channel()
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedOpenChannel, err)
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 	defer ch.Close()
-
-	q, err := hChannelQueueDeclare(ch)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
-	}
-
-	msgs, err := hChannelConsume(ch, q.Name)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessageConsume, err)
-	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationUploadFile,
@@ -472,129 +532,70 @@ func (rbot *RemoteBotAPI) UploadFile(endpoint string, params2 map[string]string,
 		Fieldname:     fieldname,
 		File:          file,
 	}
-	request, err := json.Marshal(requestMessage)
-	if err != nil {
-		panic(err)
-	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-	}
-
-	var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			rP, err := ResponseMessageUnmarshal(d.Body)
-			if err != nil {
-				return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			}
-			response = *rP
-			break
-		}
+	response, remoteBotErr := hChannelSerializePublishConsumeWithTimeoutTicker(ch, q, msgs, &requestMessage, ticker)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 
 	return response.R, response.R2.toError()
 }
 
 func (rbot *RemoteBotAPI) GetFileDirectURL(fileID string) (string, error) {
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
 	var result string
 
-	ch, err := rbot.Connection.Channel()
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedOpenChannel, err)
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 	defer ch.Close()
-
-	q, err := hChannelQueueDeclare(ch)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
-	}
-
-	msgs, err := hChannelConsume(ch, q.Name)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessageConsume, err)
-	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationGetFileDirectURL,
 		CorrelationId: randomString(RandomStringLength),
 		FileID:        fileID,
 	}
-	request, err := json.Marshal(requestMessage)
-	if err != nil {
-		panic(err)
-	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-	}
-
-	var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			rP, err := ResponseMessageUnmarshal(d.Body)
-			if err != nil {
-				return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			}
-			response = *rP
-			break
-		}
+	response, remoteBotErr := hChannelSerializePublishConsumeWithTimeoutTicker(ch, q, msgs, &requestMessage, ticker)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 
 	return response.R3, response.R2.toError()
 }
 
 func (rbot *RemoteBotAPI) GetMe() (User, error) {
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
 	var result User
 
-	ch, err := rbot.Connection.Channel()
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedOpenChannel, err)
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 	defer ch.Close()
-
-	q, err := hChannelQueueDeclare(ch)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
-	}
-
-	msgs, err := hChannelConsume(ch, q.Name)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessageConsume, err)
-	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationGetMe,
 		CorrelationId: randomString(RandomStringLength),
 	}
-	request, err := json.Marshal(requestMessage)
-	if err != nil {
-		panic(err)
-	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-	}
-
-	var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			rP, err := ResponseMessageUnmarshal(d.Body)
-			if err != nil {
-				return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			}
-			response = *rP
-			break
-		}
+	response, remoteBotErr := hChannelSerializePublishConsumeWithTimeoutTicker(ch, q, msgs, &requestMessage, ticker)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 
 	return response.R4, response.R2.toError()
 }
 
 func (rbot *RemoteBotAPI) IsMessageToMe(message Message) bool {
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
 	ch, err := rbot.Connection.Channel()
 	if err != nil {
 		//return result, hNewErrorRemoteBot(FailedOpenChannel, err)
@@ -647,417 +648,225 @@ func (rbot *RemoteBotAPI) IsMessageToMe(message Message) bool {
 }
 
 func (rbot *RemoteBotAPI) Send(c Chattable) (result Message, err error) {
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
 	cC := hConvertToConcreteChattable(c)
 
-	ch, err := rbot.Connection.Channel()
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedOpenChannel, err)
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 	defer ch.Close()
-
-	q, err := hChannelQueueDeclare(ch)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
-	}
-
-	msgs, err := hChannelConsume(ch, q.Name)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessageConsume, err)
-	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationSend,
 		CorrelationId: randomString(RandomStringLength),
 		C:             cC,
 	}
-	request, err := json.Marshal(requestMessage)
-	if err != nil {
-		panic(err)
-	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-	}
-
-	var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			rP, err := ResponseMessageUnmarshal(d.Body)
-			if err != nil {
-				return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			}
-			response = *rP
-			break
-		}
+	response, remoteBotErr := hChannelSerializePublishConsumeWithTimeoutTicker(ch, q, msgs, &requestMessage, ticker)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 
 	return response.R6, response.R2.toError()
 }
 
 func (rbot *RemoteBotAPI) GetUserProfilePhotos(config UserProfilePhotosConfig) (UserProfilePhotos, error) {
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
 	var result UserProfilePhotos
 
-	ch, err := rbot.Connection.Channel()
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedOpenChannel, err)
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 	defer ch.Close()
-
-	q, err := hChannelQueueDeclare(ch)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
-	}
-
-	msgs, err := hChannelConsume(ch, q.Name)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessageConsume, err)
-	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationGetUserProfilePhotos,
 		CorrelationId: randomString(RandomStringLength),
 		Config:        config,
 	}
-	request, err := json.Marshal(requestMessage)
-	if err != nil {
-		panic(err)
-	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-	}
-
-	var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			rP, err := ResponseMessageUnmarshal(d.Body)
-			if err != nil {
-				return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			}
-			response = *rP
-			break
-		}
+	response, remoteBotErr := hChannelSerializePublishConsumeWithTimeoutTicker(ch, q, msgs, &requestMessage, ticker)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 
 	return response.R7, response.R2.toError()
 }
 
 func (rbot *RemoteBotAPI) GetFile(config2 FileConfig) (File, error) {
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
 	var result File
 
-	ch, err := rbot.Connection.Channel()
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedOpenChannel, err)
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 	defer ch.Close()
-
-	q, err := hChannelQueueDeclare(ch)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
-	}
-
-	msgs, err := hChannelConsume(ch, q.Name)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessageConsume, err)
-	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationGetFile,
 		CorrelationId: randomString(RandomStringLength),
 		Config2:       config2,
 	}
-	request, err := json.Marshal(requestMessage)
-	if err != nil {
-		panic(err)
-	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-	}
-
-	var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			rP, err := ResponseMessageUnmarshal(d.Body)
-			if err != nil {
-				return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			}
-			response = *rP
-			break
-		}
+	response, remoteBotErr := hChannelSerializePublishConsumeWithTimeoutTicker(ch, q, msgs, &requestMessage, ticker)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 
 	return response.R8, response.R2.toError()
 }
 
 func (rbot *RemoteBotAPI) GetUpdates(config3 UpdateConfig) ([]Update, error) {
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
 	var result []Update
 
-	ch, err := rbot.Connection.Channel()
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedOpenChannel, err)
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 	defer ch.Close()
-
-	q, err := hChannelQueueDeclare(ch)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
-	}
-
-	msgs, err := hChannelConsume(ch, q.Name)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessageConsume, err)
-	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationGetUpdates,
 		CorrelationId: randomString(RandomStringLength),
 		Config3:       config3,
 	}
-	request, err := json.Marshal(requestMessage)
-	if err != nil {
-		panic(err)
-	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-	}
-
-	var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			rP, err := ResponseMessageUnmarshal(d.Body)
-			if err != nil {
-				return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			}
-			response = *rP
-			break
-		}
+	response, remoteBotErr := hChannelSerializePublishConsumeWithTimeoutTicker(ch, q, msgs, &requestMessage, ticker)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 
 	return response.R9, response.R2.toError()
 }
 
 func (rbot *RemoteBotAPI) RemoveWebhook() (APIResponse, error) {
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
 	var result APIResponse
 
-	ch, err := rbot.Connection.Channel()
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedOpenChannel, err)
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 	defer ch.Close()
-
-	q, err := hChannelQueueDeclare(ch)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
-	}
-
-	msgs, err := hChannelConsume(ch, q.Name)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessageConsume, err)
-	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationRemoveWebhook,
 		CorrelationId: randomString(RandomStringLength),
 	}
-	request, err := json.Marshal(requestMessage)
-	if err != nil {
-		panic(err)
-	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-	}
-
-	var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			rP, err := ResponseMessageUnmarshal(d.Body)
-			if err != nil {
-				return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			}
-			response = *rP
-			break
-		}
+	response, remoteBotErr := hChannelSerializePublishConsumeWithTimeoutTicker(ch, q, msgs, &requestMessage, ticker)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 
 	return response.R, response.R2.toError()
 }
 
 func (rbot *RemoteBotAPI) SetWebhook(config4 WebhookConfig) (APIResponse, error) {
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
 	var result APIResponse
 
-	ch, err := rbot.Connection.Channel()
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedOpenChannel, err)
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 	defer ch.Close()
-
-	q, err := hChannelQueueDeclare(ch)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
-	}
-
-	msgs, err := hChannelConsume(ch, q.Name)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessageConsume, err)
-	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationSetWebhook,
 		CorrelationId: randomString(RandomStringLength),
 		Config4:       config4,
 	}
-	request, err := json.Marshal(requestMessage)
-	if err != nil {
-		panic(err)
-	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-	}
-
-	var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			rP, err := ResponseMessageUnmarshal(d.Body)
-			if err != nil {
-				return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			}
-			response = *rP
-			break
-		}
+	response, remoteBotErr := hChannelSerializePublishConsumeWithTimeoutTicker(ch, q, msgs, &requestMessage, ticker)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 
 	return response.R, response.R2.toError()
 }
 
 func (rbot *RemoteBotAPI) GetWebhookInfo() (WebhookInfo, error) {
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
 	var result WebhookInfo
 
-	ch, err := rbot.Connection.Channel()
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedOpenChannel, err)
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 	defer ch.Close()
-
-	q, err := hChannelQueueDeclare(ch)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
-	}
-
-	msgs, err := hChannelConsume(ch, q.Name)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessageConsume, err)
-	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationGetWebhookInfo,
 		CorrelationId: randomString(RandomStringLength),
 	}
-	request, err := json.Marshal(requestMessage)
-	if err != nil {
-		panic(err)
-	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-	}
-
-	var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			rP, err := ResponseMessageUnmarshal(d.Body)
-			if err != nil {
-				return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			}
-			response = *rP
-			break
-		}
+	response, remoteBotErr := hChannelSerializePublishConsumeWithTimeoutTicker(ch, q, msgs, &requestMessage, ticker)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 
 	return response.R10, response.R2.toError()
 }
 
 func (rbot *RemoteBotAPI) GetUpdatesChan(config3 UpdateConfig) (UpdatesChannel, error) {
+	// TODO(tinti) not implemented
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
 	var result UpdatesChannel
 
-	ch, err := rbot.Connection.Channel()
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedOpenChannel, err)
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 	defer ch.Close()
-
-	q, err := hChannelQueueDeclare(ch)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
-	}
-
-	msgs, err := hChannelConsume(ch, q.Name)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessageConsume, err)
-	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationGetUpdatesChan,
 		CorrelationId: randomString(RandomStringLength),
 		Config3:       config3,
 	}
-	request, err := json.Marshal(requestMessage)
-	if err != nil {
-		panic(err)
+
+	response, remoteBotErr := hChannelSerializePublishConsumeWithTimeoutTicker(ch, q, msgs, &requestMessage, ticker)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-	}
-
-	var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			rP, err := ResponseMessageUnmarshal(d.Body)
-			if err != nil {
-				return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			}
-			response = *rP
-			break
-		}
-	}
-
-	c := make(UpdatesChannel)
-	return c, response.R2.toError()
+	result = make(UpdatesChannel)
+	return result, response.R2.toError()
 }
 
 func (rbot *RemoteBotAPI) ListenForWebhook(pattern string) UpdatesChannel {
-	c := make(UpdatesChannel)
+	// TODO(tinti) not implemented
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
 
-	ch, err := rbot.Connection.Channel()
-	if err != nil {
-		//return result, hNewErrorRemoteBot(FailedOpenChannel, err)
-		return c
+	var result UpdatesChannel
+
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result
 	}
 	defer ch.Close()
-
-	q, err := hChannelQueueDeclare(ch)
-	if err != nil {
-		//return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
-		return c
-	}
-
-	msgs, err := hChannelConsume(ch, q.Name)
-	if err != nil {
-		//return result, hNewErrorRemoteBot(FailedMessageConsume, err)
-		return c
-	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationListenForWebhook,
@@ -1069,1101 +878,589 @@ func (rbot *RemoteBotAPI) ListenForWebhook(pattern string) UpdatesChannel {
 		panic(err)
 	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		//return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-		return c
+	remoteBotErr = hChannelPublishWithTimeoutTicker(ch, &requestMessage, q.Name, request, ticker)
+	if remoteBotErr != nil {
+		return result
 	}
 
-	//var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			//rP, err := ResponseMessageUnmarshal(d.Body)
-			//if err != nil {
-			//	//return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			//      return c
-			//}
-			//response = *rP
-			break
-		}
+	response, remoteBotErr := hChannelConsumeWithTimeoutTicker(requestMessage.CorrelationId, msgs, ticker)
+	if remoteBotErr != nil {
+		return result
 	}
 
-	return c
+	// TODO(tinti) remove this
+	// This is just for refactoring
+	_ = response
+	return result
 }
 
 func (rbot *RemoteBotAPI) AnswerInlineQuery(config5 InlineConfig) (APIResponse, error) {
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
 	var result APIResponse
 
-	ch, err := rbot.Connection.Channel()
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedOpenChannel, err)
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 	defer ch.Close()
-
-	q, err := hChannelQueueDeclare(ch)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
-	}
-
-	msgs, err := hChannelConsume(ch, q.Name)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessageConsume, err)
-	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationAnswerInlineQuery,
 		CorrelationId: randomString(RandomStringLength),
 		Config5:       config5,
 	}
-	request, err := json.Marshal(requestMessage)
-	if err != nil {
-		panic(err)
-	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-	}
-
-	var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			rP, err := ResponseMessageUnmarshal(d.Body)
-			if err != nil {
-				return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			}
-			response = *rP
-			break
-		}
+	response, remoteBotErr := hChannelSerializePublishConsumeWithTimeoutTicker(ch, q, msgs, &requestMessage, ticker)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 
 	return response.R, response.R2.toError()
 }
 
 func (rbot *RemoteBotAPI) AnswerCallbackQuery(config6 CallbackConfig) (APIResponse, error) {
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
 	var result APIResponse
 
-	ch, err := rbot.Connection.Channel()
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedOpenChannel, err)
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 	defer ch.Close()
-
-	q, err := hChannelQueueDeclare(ch)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
-	}
-
-	msgs, err := hChannelConsume(ch, q.Name)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessageConsume, err)
-	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationAnswerCallbackQuery,
 		CorrelationId: randomString(RandomStringLength),
 		Config6:       config6,
 	}
-	request, err := json.Marshal(requestMessage)
-	if err != nil {
-		panic(err)
-	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-	}
-
-	var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			rP, err := ResponseMessageUnmarshal(d.Body)
-			if err != nil {
-				return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			}
-			response = *rP
-			break
-		}
+	response, remoteBotErr := hChannelSerializePublishConsumeWithTimeoutTicker(ch, q, msgs, &requestMessage, ticker)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 
 	return response.R, response.R2.toError()
 }
 
 func (rbot *RemoteBotAPI) KickChatMember(config7 KickChatMemberConfig) (APIResponse, error) {
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
 	var result APIResponse
 
-	ch, err := rbot.Connection.Channel()
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedOpenChannel, err)
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 	defer ch.Close()
-
-	q, err := hChannelQueueDeclare(ch)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
-	}
-
-	msgs, err := hChannelConsume(ch, q.Name)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessageConsume, err)
-	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationKickChatMember,
 		CorrelationId: randomString(RandomStringLength),
 		Config7:       config7,
 	}
-	request, err := json.Marshal(requestMessage)
-	if err != nil {
-		panic(err)
-	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-	}
-
-	var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			rP, err := ResponseMessageUnmarshal(d.Body)
-			if err != nil {
-				return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			}
-			response = *rP
-			break
-		}
+	response, remoteBotErr := hChannelSerializePublishConsumeWithTimeoutTicker(ch, q, msgs, &requestMessage, ticker)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 
 	return response.R, response.R2.toError()
 }
 
 func (rbot *RemoteBotAPI) LeaveChat(config8 ChatConfig) (APIResponse, error) {
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
 	var result APIResponse
 
-	ch, err := rbot.Connection.Channel()
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedOpenChannel, err)
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 	defer ch.Close()
-
-	q, err := hChannelQueueDeclare(ch)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
-	}
-
-	msgs, err := hChannelConsume(ch, q.Name)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessageConsume, err)
-	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationLeaveChat,
 		CorrelationId: randomString(RandomStringLength),
 		Config8:       config8,
 	}
-	request, err := json.Marshal(requestMessage)
-	if err != nil {
-		panic(err)
-	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-	}
-
-	var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			rP, err := ResponseMessageUnmarshal(d.Body)
-			if err != nil {
-				return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			}
-			response = *rP
-			break
-		}
+	response, remoteBotErr := hChannelSerializePublishConsumeWithTimeoutTicker(ch, q, msgs, &requestMessage, ticker)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 
 	return response.R, response.R2.toError()
 }
 
 func (rbot *RemoteBotAPI) GetChat(config8 ChatConfig) (Chat, error) {
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
 	var result Chat
 
-	ch, err := rbot.Connection.Channel()
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedOpenChannel, err)
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 	defer ch.Close()
-
-	q, err := hChannelQueueDeclare(ch)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
-	}
-
-	msgs, err := hChannelConsume(ch, q.Name)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessageConsume, err)
-	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationGetChat,
 		CorrelationId: randomString(RandomStringLength),
 		Config8:       config8,
 	}
-	request, err := json.Marshal(requestMessage)
-	if err != nil {
-		panic(err)
-	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-	}
-
-	var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			rP, err := ResponseMessageUnmarshal(d.Body)
-			if err != nil {
-				return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			}
-			response = *rP
-			break
-		}
+	response, remoteBotErr := hChannelSerializePublishConsumeWithTimeoutTicker(ch, q, msgs, &requestMessage, ticker)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 
 	return response.R12, response.R2.toError()
 }
 
 func (rbot *RemoteBotAPI) GetChatAdministrators(config8 ChatConfig) ([]ChatMember, error) {
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
 	var result []ChatMember
 
-	ch, err := rbot.Connection.Channel()
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedOpenChannel, err)
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 	defer ch.Close()
-
-	q, err := hChannelQueueDeclare(ch)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
-	}
-
-	msgs, err := hChannelConsume(ch, q.Name)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessageConsume, err)
-	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationGetChatAdministrators,
 		CorrelationId: randomString(RandomStringLength),
 		Config8:       config8,
 	}
-	request, err := json.Marshal(requestMessage)
-	if err != nil {
-		panic(err)
-	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-	}
-
-	var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			rP, err := ResponseMessageUnmarshal(d.Body)
-			if err != nil {
-				return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			}
-			response = *rP
-			break
-		}
+	response, remoteBotErr := hChannelSerializePublishConsumeWithTimeoutTicker(ch, q, msgs, &requestMessage, ticker)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 
 	return response.R13, response.R2.toError()
 }
 
 func (rbot *RemoteBotAPI) GetChatMembersCount(config8 ChatConfig) (int, error) {
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
 	var result int
 
-	ch, err := rbot.Connection.Channel()
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedOpenChannel, err)
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 	defer ch.Close()
-
-	q, err := hChannelQueueDeclare(ch)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
-	}
-
-	msgs, err := hChannelConsume(ch, q.Name)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessageConsume, err)
-	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationGetChatMembersCount,
 		CorrelationId: randomString(RandomStringLength),
 		Config8:       config8,
 	}
-	request, err := json.Marshal(requestMessage)
-	if err != nil {
-		panic(err)
-	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-	}
-
-	var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			rP, err := ResponseMessageUnmarshal(d.Body)
-			if err != nil {
-				return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			}
-			response = *rP
-			break
-		}
+	response, remoteBotErr := hChannelSerializePublishConsumeWithTimeoutTicker(ch, q, msgs, &requestMessage, ticker)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 
 	return response.R14, response.R2.toError()
 }
 
 func (rbot *RemoteBotAPI) GetChatMember(config9 ChatConfigWithUser) (ChatMember, error) {
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
 	var result ChatMember
 
-	ch, err := rbot.Connection.Channel()
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedOpenChannel, err)
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 	defer ch.Close()
-
-	q, err := hChannelQueueDeclare(ch)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
-	}
-
-	msgs, err := hChannelConsume(ch, q.Name)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessageConsume, err)
-	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationGetChatMember,
 		CorrelationId: randomString(RandomStringLength),
 		Config9:       config9,
 	}
-	request, err := json.Marshal(requestMessage)
-	if err != nil {
-		panic(err)
-	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-	}
-
-	var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			rP, err := ResponseMessageUnmarshal(d.Body)
-			if err != nil {
-				return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			}
-			response = *rP
-			break
-		}
+	response, remoteBotErr := hChannelSerializePublishConsumeWithTimeoutTicker(ch, q, msgs, &requestMessage, ticker)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 
 	return response.R15, response.R2.toError()
 }
 
 func (rbot *RemoteBotAPI) UnbanChatMember(config10 ChatMemberConfig) (APIResponse, error) {
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
 	var result APIResponse
 
-	ch, err := rbot.Connection.Channel()
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedOpenChannel, err)
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 	defer ch.Close()
-
-	q, err := hChannelQueueDeclare(ch)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
-	}
-
-	msgs, err := hChannelConsume(ch, q.Name)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessageConsume, err)
-	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationUnbanChatMember,
 		CorrelationId: randomString(RandomStringLength),
 		Config10:      config10,
 	}
-	request, err := json.Marshal(requestMessage)
-	if err != nil {
-		panic(err)
-	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-	}
-
-	var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			rP, err := ResponseMessageUnmarshal(d.Body)
-			if err != nil {
-				return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			}
-			response = *rP
-			break
-		}
+	response, remoteBotErr := hChannelSerializePublishConsumeWithTimeoutTicker(ch, q, msgs, &requestMessage, ticker)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 
 	return response.R, response.R2.toError()
 }
 
 func (rbot *RemoteBotAPI) RestrictChatMember(config11 RestrictChatMemberConfig) (APIResponse, error) {
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
 	var result APIResponse
 
-	ch, err := rbot.Connection.Channel()
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedOpenChannel, err)
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 	defer ch.Close()
-
-	q, err := hChannelQueueDeclare(ch)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
-	}
-
-	msgs, err := hChannelConsume(ch, q.Name)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessageConsume, err)
-	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationRestrictChatMember,
 		CorrelationId: randomString(RandomStringLength),
 		Config11:      config11,
 	}
-	request, err := json.Marshal(requestMessage)
-	if err != nil {
-		panic(err)
-	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-	}
-
-	var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			rP, err := ResponseMessageUnmarshal(d.Body)
-			if err != nil {
-				return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			}
-			response = *rP
-			break
-		}
+	response, remoteBotErr := hChannelSerializePublishConsumeWithTimeoutTicker(ch, q, msgs, &requestMessage, ticker)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 
 	return response.R, response.R2.toError()
 }
 
 func (rbot *RemoteBotAPI) PromoteChatMember(config12 PromoteChatMemberConfig) (APIResponse, error) {
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
 	var result APIResponse
 
-	ch, err := rbot.Connection.Channel()
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedOpenChannel, err)
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 	defer ch.Close()
-
-	q, err := hChannelQueueDeclare(ch)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
-	}
-
-	msgs, err := hChannelConsume(ch, q.Name)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessageConsume, err)
-	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationPromoteChatMember,
 		CorrelationId: randomString(RandomStringLength),
 		Config12:      config12,
 	}
-	request, err := json.Marshal(requestMessage)
-	if err != nil {
-		panic(err)
-	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-	}
-
-	var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			rP, err := ResponseMessageUnmarshal(d.Body)
-			if err != nil {
-				return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			}
-			response = *rP
-			break
-		}
+	response, remoteBotErr := hChannelSerializePublishConsumeWithTimeoutTicker(ch, q, msgs, &requestMessage, ticker)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 
 	return response.R, response.R2.toError()
 }
 
 func (rbot *RemoteBotAPI) GetGameHighScores(config13 GetGameHighScoresConfig) ([]GameHighScore, error) {
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
 	var result []GameHighScore
 
-	ch, err := rbot.Connection.Channel()
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedOpenChannel, err)
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 	defer ch.Close()
-
-	q, err := hChannelQueueDeclare(ch)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
-	}
-
-	msgs, err := hChannelConsume(ch, q.Name)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessageConsume, err)
-	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationGetGameHighScores,
 		CorrelationId: randomString(RandomStringLength),
 		Config13:      config13,
 	}
-	request, err := json.Marshal(requestMessage)
-	if err != nil {
-		panic(err)
-	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-	}
-
-	var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			rP, err := ResponseMessageUnmarshal(d.Body)
-			if err != nil {
-				return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			}
-			response = *rP
-			break
-		}
+	response, remoteBotErr := hChannelSerializePublishConsumeWithTimeoutTicker(ch, q, msgs, &requestMessage, ticker)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 
 	return response.R16, response.R2.toError()
 }
 
 func (rbot *RemoteBotAPI) AnswerShippingQuery(config14 ShippingConfig) (APIResponse, error) {
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
 	var result APIResponse
 
-	ch, err := rbot.Connection.Channel()
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedOpenChannel, err)
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 	defer ch.Close()
-
-	q, err := hChannelQueueDeclare(ch)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
-	}
-
-	msgs, err := hChannelConsume(ch, q.Name)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessageConsume, err)
-	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationAnswerShippingQuery,
 		CorrelationId: randomString(RandomStringLength),
 		Config14:      config14,
 	}
-	request, err := json.Marshal(requestMessage)
-	if err != nil {
-		panic(err)
-	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-	}
-
-	var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			rP, err := ResponseMessageUnmarshal(d.Body)
-			if err != nil {
-				return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			}
-			response = *rP
-			break
-		}
+	response, remoteBotErr := hChannelSerializePublishConsumeWithTimeoutTicker(ch, q, msgs, &requestMessage, ticker)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 
 	return response.R, response.R2.toError()
 }
 
 func (rbot *RemoteBotAPI) AnswerPreCheckoutQuery(config15 PreCheckoutConfig) (APIResponse, error) {
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
 	var result APIResponse
 
-	ch, err := rbot.Connection.Channel()
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedOpenChannel, err)
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 	defer ch.Close()
-
-	q, err := hChannelQueueDeclare(ch)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
-	}
-
-	msgs, err := hChannelConsume(ch, q.Name)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessageConsume, err)
-	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationAnswerPreCheckoutQuery,
 		CorrelationId: randomString(RandomStringLength),
 		Config15:      config15,
 	}
-	request, err := json.Marshal(requestMessage)
-	if err != nil {
-		panic(err)
-	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-	}
-
-	var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			rP, err := ResponseMessageUnmarshal(d.Body)
-			if err != nil {
-				return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			}
-			response = *rP
-			break
-		}
+	response, remoteBotErr := hChannelSerializePublishConsumeWithTimeoutTicker(ch, q, msgs, &requestMessage, ticker)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 
 	return response.R, response.R2.toError()
 }
 
 func (rbot *RemoteBotAPI) DeleteMessage(config16 DeleteMessageConfig) (APIResponse, error) {
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
 	var result APIResponse
 
-	ch, err := rbot.Connection.Channel()
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedOpenChannel, err)
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 	defer ch.Close()
-
-	q, err := hChannelQueueDeclare(ch)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
-	}
-
-	msgs, err := hChannelConsume(ch, q.Name)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessageConsume, err)
-	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationDeleteMessage,
 		CorrelationId: randomString(RandomStringLength),
 		Config16:      config16,
 	}
-	request, err := json.Marshal(requestMessage)
-	if err != nil {
-		panic(err)
-	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-	}
-
-	var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			rP, err := ResponseMessageUnmarshal(d.Body)
-			if err != nil {
-				return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			}
-			response = *rP
-			break
-		}
+	response, remoteBotErr := hChannelSerializePublishConsumeWithTimeoutTicker(ch, q, msgs, &requestMessage, ticker)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 
 	return response.R, response.R2.toError()
 }
 
 func (rbot *RemoteBotAPI) GetInviteLink(config8 ChatConfig) (string, error) {
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
 	var result string
 
-	ch, err := rbot.Connection.Channel()
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedOpenChannel, err)
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 	defer ch.Close()
-
-	q, err := hChannelQueueDeclare(ch)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
-	}
-
-	msgs, err := hChannelConsume(ch, q.Name)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessageConsume, err)
-	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationGetInviteLink,
 		CorrelationId: randomString(RandomStringLength),
 		Config8:       config8,
 	}
-	request, err := json.Marshal(requestMessage)
-	if err != nil {
-		panic(err)
-	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-	}
-
-	var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			rP, err := ResponseMessageUnmarshal(d.Body)
-			if err != nil {
-				return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			}
-			response = *rP
-			break
-		}
+	response, remoteBotErr := hChannelSerializePublishConsumeWithTimeoutTicker(ch, q, msgs, &requestMessage, ticker)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 
 	return response.R3, response.R2.toError()
 }
 
 func (rbot *RemoteBotAPI) PinChatMessage(config17 PinChatMessageConfig) (APIResponse, error) {
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
 	var result APIResponse
 
-	ch, err := rbot.Connection.Channel()
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedOpenChannel, err)
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 	defer ch.Close()
-
-	q, err := hChannelQueueDeclare(ch)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
-	}
-
-	msgs, err := hChannelConsume(ch, q.Name)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessageConsume, err)
-	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationPinChatMessage,
 		CorrelationId: randomString(RandomStringLength),
 		Config17:      config17,
 	}
-	request, err := json.Marshal(requestMessage)
-	if err != nil {
-		panic(err)
-	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-	}
-
-	var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			rP, err := ResponseMessageUnmarshal(d.Body)
-			if err != nil {
-				return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			}
-			response = *rP
-			break
-		}
+	response, remoteBotErr := hChannelSerializePublishConsumeWithTimeoutTicker(ch, q, msgs, &requestMessage, ticker)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 
 	return response.R, response.R2.toError()
 }
 
 func (rbot *RemoteBotAPI) UnpinChatMessage(config18 UnpinChatMessageConfig) (APIResponse, error) {
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
 	var result APIResponse
 
-	ch, err := rbot.Connection.Channel()
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedOpenChannel, err)
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 	defer ch.Close()
-
-	q, err := hChannelQueueDeclare(ch)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
-	}
-
-	msgs, err := hChannelConsume(ch, q.Name)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessageConsume, err)
-	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationUnpinChatMessage,
 		CorrelationId: randomString(RandomStringLength),
 		Config18:      config18,
 	}
-	request, err := json.Marshal(requestMessage)
-	if err != nil {
-		panic(err)
-	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-	}
-
-	var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			rP, err := ResponseMessageUnmarshal(d.Body)
-			if err != nil {
-				return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			}
-			response = *rP
-			break
-		}
+	response, remoteBotErr := hChannelSerializePublishConsumeWithTimeoutTicker(ch, q, msgs, &requestMessage, ticker)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 
 	return response.R, response.R2.toError()
 }
 
 func (rbot *RemoteBotAPI) SetChatTitle(config19 SetChatTitleConfig) (APIResponse, error) {
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
 	var result APIResponse
 
-	ch, err := rbot.Connection.Channel()
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedOpenChannel, err)
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 	defer ch.Close()
-
-	q, err := hChannelQueueDeclare(ch)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
-	}
-
-	msgs, err := hChannelConsume(ch, q.Name)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessageConsume, err)
-	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationSetChatTitle,
 		CorrelationId: randomString(RandomStringLength),
 		Config19:      config19,
 	}
-	request, err := json.Marshal(requestMessage)
-	if err != nil {
-		panic(err)
-	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-	}
-
-	var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			rP, err := ResponseMessageUnmarshal(d.Body)
-			if err != nil {
-				return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			}
-			response = *rP
-			break
-		}
+	response, remoteBotErr := hChannelSerializePublishConsumeWithTimeoutTicker(ch, q, msgs, &requestMessage, ticker)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 
 	return response.R, response.R2.toError()
 }
 
 func (rbot *RemoteBotAPI) SetChatDescription(config20 SetChatDescriptionConfig) (APIResponse, error) {
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
 	var result APIResponse
 
-	ch, err := rbot.Connection.Channel()
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedOpenChannel, err)
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 	defer ch.Close()
-
-	q, err := hChannelQueueDeclare(ch)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
-	}
-
-	msgs, err := hChannelConsume(ch, q.Name)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessageConsume, err)
-	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationSetChatDescription,
 		CorrelationId: randomString(RandomStringLength),
 		Config20:      config20,
 	}
-	request, err := json.Marshal(requestMessage)
-	if err != nil {
-		panic(err)
-	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-	}
-
-	var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			rP, err := ResponseMessageUnmarshal(d.Body)
-			if err != nil {
-				return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			}
-			response = *rP
-			break
-		}
+	response, remoteBotErr := hChannelSerializePublishConsumeWithTimeoutTicker(ch, q, msgs, &requestMessage, ticker)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 
 	return response.R, response.R2.toError()
 }
 
 func (rbot *RemoteBotAPI) SetChatPhoto(config21 SetChatPhotoConfig) (APIResponse, error) {
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
 	var result APIResponse
 
-	ch, err := rbot.Connection.Channel()
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedOpenChannel, err)
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 	defer ch.Close()
-
-	q, err := hChannelQueueDeclare(ch)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
-	}
-
-	msgs, err := hChannelConsume(ch, q.Name)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessageConsume, err)
-	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationSetChatPhoto,
 		CorrelationId: randomString(RandomStringLength),
 		Config21:      config21,
 	}
-	request, err := json.Marshal(requestMessage)
-	if err != nil {
-		panic(err)
-	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-	}
-
-	var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			rP, err := ResponseMessageUnmarshal(d.Body)
-			if err != nil {
-				return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			}
-			response = *rP
-			break
-		}
+	response, remoteBotErr := hChannelSerializePublishConsumeWithTimeoutTicker(ch, q, msgs, &requestMessage, ticker)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 
 	return response.R, response.R2.toError()
 }
 
 func (rbot *RemoteBotAPI) DeleteChatPhoto(config22 DeleteChatPhotoConfig) (APIResponse, error) {
+	ticker := time.NewTicker(rbot.Timeout)
+	defer ticker.Stop()
+
 	var result APIResponse
 
-	ch, err := rbot.Connection.Channel()
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedOpenChannel, err)
+	ch, q, msgs, remoteBotErr := hCreateChannelQueueDeclareConsume(rbot.Connection)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 	defer ch.Close()
-
-	q, err := hChannelQueueDeclare(ch)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedDeclareQueue, err)
-	}
-
-	msgs, err := hChannelConsume(ch, q.Name)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessageConsume, err)
-	}
 
 	requestMessage := RequestMessage{
 		Operation:     OperationDeleteChatPhoto,
 		CorrelationId: randomString(RandomStringLength),
 		Config22:      config22,
 	}
-	request, err := json.Marshal(requestMessage)
-	if err != nil {
-		panic(err)
-	}
 
-	err = hChannelPublish(ch, &requestMessage, q.Name, request)
-	if err != nil {
-		return result, hNewErrorRemoteBot(FailedMessagePublish, err)
-	}
-
-	var response ResponseMessage
-	for d := range msgs {
-		if requestMessage.CorrelationId == d.CorrelationId {
-			rP, err := ResponseMessageUnmarshal(d.Body)
-			if err != nil {
-				return result, hNewErrorRemoteBot(FailedConvertBodyResponse, err)
-			}
-			response = *rP
-			break
-		}
+	response, remoteBotErr := hChannelSerializePublishConsumeWithTimeoutTicker(ch, q, msgs, &requestMessage, ticker)
+	if remoteBotErr != nil {
+		return result, remoteBotErr
 	}
 
 	return response.R, response.R2.toError()
