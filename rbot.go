@@ -1466,16 +1466,21 @@ func (rbot *RemoteBotAPI) DeleteChatPhoto(config22 DeleteChatPhotoConfig) (APIRe
 	return response.R, response.R2.toError()
 }
 
-func SimpleServer(url string, bot *BotAPI) {
+func SimpleServerDefault(url string, bot *BotAPI) {
+	SimpleServer(url, bot, func(error) {})
+}
+
+func SimpleServer(url string, bot *BotAPI, errorHandler func(error)) error {
 	conn, err := amqp.Dial(url)
 	if err != nil {
-		panic(err)
+		errorHandler(err)
 	}
-	//failOnError(err, FailedConnect)
+
+	return hNewErrorRemoteBot(FailedConnect, err)
 	defer conn.Close()
 
 	ch, err := conn.Channel()
-	//failOnError(err, FailedOpenChannel)
+	return hNewErrorRemoteBot(FailedOpenChannel, err)
 	defer ch.Close()
 
 	q, err := ch.QueueDeclare(
@@ -1486,14 +1491,14 @@ func SimpleServer(url string, bot *BotAPI) {
 		false,      // no-wait
 		nil,        // arguments
 	)
-	//failOnError(err, FailedDeclareQueue)
+	return hNewErrorRemoteBot(FailedDeclareQueue, err)
 
 	err = ch.Qos(
 		1,     // prefetch count
 		0,     // prefetch size
 		false, // global
 	)
-	//failOnError(err, FailedOptionQoS)
+	return hNewErrorRemoteBot(FailedOptionQoS, err)
 
 	msgs, err := ch.Consume(
 		q.Name, // queue
@@ -1504,16 +1509,15 @@ func SimpleServer(url string, bot *BotAPI) {
 		false,  // no-wait
 		nil,    // args
 	)
-	//failOnError(err, FailedMessageConsume)
+	return hNewErrorRemoteBot(FailedMessageConsume, err)
 
 	forever := make(chan bool)
 
 	go func() {
 		for d := range msgs {
 			nP, err := RequestMessageUnmarshal(d.Body)
-			//failOnError(err, FailedConvertBodyRequest)
 			if err != nil {
-				panic(err)
+				errorHandler(err)
 			}
 			n := *nP
 
@@ -2009,9 +2013,10 @@ func SimpleServer(url string, bot *BotAPI) {
 
 				r.Operation, r.CorrelationId = n.Operation, n.CorrelationId
 			}
+
 			response, err := json.Marshal(r)
 			if err != nil {
-				panic(err)
+				errorHandler(err)
 			}
 
 			err = ch.Publish(
@@ -2024,11 +2029,15 @@ func SimpleServer(url string, bot *BotAPI) {
 					CorrelationId: d.CorrelationId,
 					Body:          response,
 				})
-			//failOnError(err, FailedMessagePublish)
+			if err != nil {
+				errorHandler(hNewErrorRemoteBot(FailedMessagePublish, err))
+			}
 
 			d.Ack(false)
 		}
 	}()
 
 	<-forever
+
+	return nil
 }
